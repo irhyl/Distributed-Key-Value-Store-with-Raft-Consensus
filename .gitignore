@@ -1,0 +1,22 @@
+# Binaries
+raftkv-server
+raftkv-cli
+
+# Go build cache
+*.test
+*.out
+
+# Module download cache
+vendor/
+
+# Data directories created during testing or local cluster runs
+/tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp
