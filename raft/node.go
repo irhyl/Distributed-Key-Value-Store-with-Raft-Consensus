@@ -121,7 +121,7 @@ func NewNode(cfg Config, transport Transport, storage PersistentState) *Node {
 		role:      RoleFollower,
 		transport: transport,
 		storage:   storage,
-		CommitCh:  make(chan CommitNotify, 256),
+		CommitCh:  make(chan CommitNotify, 4096),
 		stopCh:    make(chan struct{}),
 		nextIndex:  make(map[string]uint64),
 		matchIndex: make(map[string]uint64),
@@ -195,7 +195,9 @@ func (n *Node) Propose(data []byte) (uint64, uint64, bool) {
 	}
 
 	n.log = append(n.log, entry)
-	n.storage.AppendEntries([]*LogEntry{entry}) //nolint:errcheck
+	if err := n.storage.AppendEntries([]*LogEntry{entry}); err != nil {
+		log.Printf("[%s] ERROR: persist proposed entry %d: %v", n.cfg.ID, entry.Index, err)
+	}
 
 	// Immediately replicate to all peers (don't wait for the heartbeat tick)
 	// Self is always counted implicitly in maybeAdvanceCommit (the +1 base count).
@@ -263,7 +265,9 @@ func (n *Node) startElection() {
 	n.currentTerm++
 	n.role = RoleCandidate
 	n.votedFor = n.cfg.ID // vote for ourselves
-	n.storage.SaveHardState(n.currentTerm, n.votedFor) //nolint:errcheck
+	if err := n.storage.SaveHardState(n.currentTerm, n.votedFor); err != nil {
+		log.Printf("[%s] ERROR: save hard state: %v", n.cfg.ID, err)
+	}
 	n.resetElectionTimer()
 
 	term := n.currentTerm
@@ -342,7 +346,9 @@ func (n *Node) becomeFollower(term uint64) {
 	if term > n.currentTerm {
 		n.currentTerm = term
 		n.votedFor = ""
-		n.storage.SaveHardState(n.currentTerm, n.votedFor) //nolint:errcheck
+		if err := n.storage.SaveHardState(n.currentTerm, n.votedFor); err != nil {
+			log.Printf("[%s] ERROR: save hard state on term update: %v", n.cfg.ID, err)
+		}
 	}
 	n.resetElectionTimer()
 }
@@ -383,7 +389,9 @@ func (n *Node) HandleRequestVote(req *pb.RequestVoteRequest) *pb.RequestVoteResp
 
 	// Grant the vote
 	n.votedFor = req.CandidateId
-	n.storage.SaveHardState(n.currentTerm, n.votedFor) //nolint:errcheck
+	if err := n.storage.SaveHardState(n.currentTerm, n.votedFor); err != nil {
+		log.Printf("[%s] ERROR: save vote for %s: %v", n.cfg.ID, req.CandidateId, err)
+	}
 	n.resetElectionTimer() // reset so we don't start our own election immediately
 	resp.VoteGranted = true
 	return resp
@@ -442,7 +450,9 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 			if n.log[idx].Term != entry.Term {
 				// Conflict: truncate our log here and append from leader
 				n.log = n.log[:idx]
-				n.storage.TruncateSuffix(idx - 1) //nolint:errcheck
+				if err := n.storage.TruncateSuffix(idx - 1); err != nil {
+					log.Printf("[%s] ERROR: truncate log at %d: %v", n.cfg.ID, idx-1, err)
+				}
 			} else {
 				continue // entry already in our log, skip
 			}
@@ -452,7 +462,9 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 
 	// Persist new entries
 	if len(req.Entries) > 0 {
-		n.storage.AppendEntries(req.Entries) //nolint:errcheck
+		if err := n.storage.AppendEntries(req.Entries); err != nil {
+			log.Printf("[%s] ERROR: persist %d entries from leader: %v", n.cfg.ID, len(req.Entries), err)
+		}
 	}
 
 	// Advance commitIndex if leader's commit is ahead of ours
@@ -620,20 +632,34 @@ func (n *Node) maybeAdvanceCommit() {
 }
 
 // advanceCommitTo advances commitIndex to newCommit and notifies the application.
+// Entries are collected under the lock, then sent without holding it so that
+// RPC handlers are not blocked while the state machine drains the channel.
 // MUST be called with n.mu held.
 func (n *Node) advanceCommitTo(newCommit uint64) {
+	var toNotify []*LogEntry
 	for i := n.commitIndex + 1; i <= newCommit; i++ {
 		if i < uint64(len(n.log)) {
-			entry := n.log[i]
-			select {
-			case n.CommitCh <- CommitNotify{Entry: entry}:
-			default:
-				// Channel full — application is slow. In production, block or use backpressure.
-				log.Printf("[%s] WARN: CommitCh full, dropping entry %d", n.cfg.ID, i)
-			}
+			toNotify = append(toNotify, n.log[i])
 		}
 	}
 	n.commitIndex = newCommit
+
+	if len(toNotify) == 0 {
+		return
+	}
+
+	// Release the lock while sending so RPC handlers can still acquire it.
+	// Entries are already committed; releasing here is safe.
+	n.mu.Unlock()
+	for _, entry := range toNotify {
+		select {
+		case n.CommitCh <- CommitNotify{Entry: entry}:
+		case <-n.stopCh:
+			n.mu.Lock()
+			return
+		}
+	}
+	n.mu.Lock()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

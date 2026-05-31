@@ -25,6 +25,7 @@ type KVServer struct {
 	pb.UnimplementedRaftServiceServer
 	pb.UnimplementedKVServiceServer
 
+	cfg       Config
 	node      *raft.Node
 	engine    *storage.Engine
 	sm        *StateMachine
@@ -38,6 +39,20 @@ type Config struct {
 	ListenAddr  string            // address to bind the gRPC server on
 	Peers       map[string]string // peerID → gRPC address (other nodes)
 	DataDir     string            // directory for WAL and SSTable files
+}
+
+// leaderHintAddr translates the Raft leader ID returned by node.LeaderID()
+// into a dialable gRPC address for the client to redirect to.
+// Returns "" if the leader is unknown.
+func (s *KVServer) leaderHintAddr() string {
+	id := s.node.LeaderID()
+	if id == "" {
+		return ""
+	}
+	if id == s.cfg.NodeID {
+		return s.cfg.ListenAddr
+	}
+	return s.cfg.Peers[id] // "" if id not in peers map
 }
 
 // NewKVServer creates and wires up a fully configured KVServer.
@@ -72,6 +87,7 @@ func NewKVServer(cfg Config) (*KVServer, error) {
 	// 6. Build the gRPC server
 	grpcSrv := grpc.NewServer()
 	srv := &KVServer{
+		cfg:       cfg,
 		node:      node,
 		engine:    eng,
 		sm:        sm,
@@ -137,7 +153,7 @@ func (s *KVServer) InstallSnapshot(_ context.Context, req *pb.InstallSnapshotReq
 func (s *KVServer) Get(_ context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
 	val, found, err := s.sm.ReadValue(req.Key)
 	if err == ErrNotLeader {
-		return &pb.GetResponse{LeaderHint: s.node.LeaderID()}, nil
+		return &pb.GetResponse{LeaderHint: s.leaderHintAddr()}, nil
 	}
 	if err != nil {
 		return nil, err
@@ -155,7 +171,7 @@ func (s *KVServer) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, 
 	cmd := Command{Op: "put", Key: req.Key, Value: req.Value}
 	err := s.sm.ProposeWrite(cmd)
 	if err == ErrNotLeader {
-		return &pb.PutResponse{LeaderHint: s.node.LeaderID()}, nil
+		return &pb.PutResponse{LeaderHint: s.leaderHintAddr()}, nil
 	}
 	if err != nil {
 		return nil, err
@@ -168,7 +184,7 @@ func (s *KVServer) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteR
 	cmd := Command{Op: "delete", Key: req.Key}
 	err := s.sm.ProposeWrite(cmd)
 	if err == ErrNotLeader {
-		return &pb.DeleteResponse{LeaderHint: s.node.LeaderID()}, nil
+		return &pb.DeleteResponse{LeaderHint: s.leaderHintAddr()}, nil
 	}
 	if err != nil {
 		return nil, err

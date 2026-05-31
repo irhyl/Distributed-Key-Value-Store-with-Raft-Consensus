@@ -17,6 +17,7 @@ package storage
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -223,13 +224,13 @@ func (e *Engine) doFlush() {
 	entries := imm.Snapshot()
 	writer := NewSSTableWriter(path)
 	if err := writer.Write(entries); err != nil {
-		fmt.Printf("storage: flush error: %v\n", err)
+		log.Printf("storage: flush error: %v\n", err)
 		return
 	}
 
 	reader, err := OpenSSTable(path)
 	if err != nil {
-		fmt.Printf("storage: open new sst error: %v\n", err)
+		log.Printf("storage: open new sst error: %v\n", err)
 		return
 	}
 
@@ -281,7 +282,7 @@ func (e *Engine) doCompaction() {
 	for i := len(toCompact) - 1; i >= 0; i-- {
 		entries, err := toCompact[i].IterateAll()
 		if err != nil {
-			fmt.Printf("storage: compaction read error: %v\n", err)
+			log.Printf("storage: compaction read error: %v\n", err)
 			return
 		}
 		inputs = append(inputs, entries)
@@ -295,13 +296,13 @@ func (e *Engine) doCompaction() {
 	newPath := filepath.Join(e.dir, fmt.Sprintf("%016d.sst", seq))
 	writer := NewSSTableWriter(newPath)
 	if err := writer.Write(merged); err != nil {
-		fmt.Printf("storage: compaction write error: %v\n", err)
+		log.Printf("storage: compaction write error: %v\n", err)
 		return
 	}
 
 	newReader, err := OpenSSTable(newPath)
 	if err != nil {
-		fmt.Printf("storage: compaction open error: %v\n", err)
+		log.Printf("storage: compaction open error: %v\n", err)
 		return
 	}
 
@@ -319,7 +320,7 @@ func (e *Engine) doCompaction() {
 		os.Remove(p)
 	}
 
-	fmt.Printf("storage: compacted %d SSTables → 1 (%d entries)\n",
+	log.Printf("storage: compacted %d SSTables → 1 (%d entries)\n",
 		len(toCompact), len(merged))
 }
 
@@ -341,7 +342,7 @@ func (e *Engine) loadSSTables() error {
 	for _, p := range paths {
 		r, err := OpenSSTable(p)
 		if err != nil {
-			fmt.Printf("storage: skipping corrupt SSTable %s: %v\n", p, err)
+			log.Printf("storage: skipping corrupt SSTable %s: %v\n", p, err)
 			continue
 		}
 		e.sstables = append(e.sstables, r)
