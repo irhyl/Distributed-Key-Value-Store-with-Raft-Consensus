@@ -1,4 +1,4 @@
-# raftkv
+# Distributed Key-Value Store with RAFT Consensus
 
 A distributed key-value store built from scratch in Go, implementing the same primitives that power **etcd**, **CockroachDB**, and **TiKV**: Raft consensus, a write-ahead log, and an LSM-tree storage engine.
 
@@ -12,7 +12,7 @@ Fault-tolerant across any minority of node failures. A 3-node cluster survives o
 client PUT foo=bar
         │
         ▼
-raftkv-cli  ──gRPC──►  KVServer (leader)
+raftkv-cli ── gRPC──►  KVServer (leader)
                               │
                         1. Append to WAL    ← crash-safe before anything else
                               │
@@ -25,7 +25,7 @@ raftkv-cli  ──gRPC──►  KVServer (leader)
                         5. Return OK        ← client gets confirmation
 ```
 
-If the leader crashes after step 3, a new leader is elected and the entry is still committed — it was already on a majority. If it crashes before step 3, the entry is lost and the client retries.
+If the leader crashes after step 3, a new leader is elected and the entry is still committed it was already on a majority. If it crashes before step 3, the entry is lost and the client retries.
 
 ---
 

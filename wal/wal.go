@@ -192,9 +192,15 @@ func (w *WAL) TruncateSuffix(keepIndex uint64) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// Flush buffered writer before reading back from disk
+	// Flush and close the current segment before reading back or deleting.
+	// On Windows an open file cannot be deleted; closing first ensures Remove succeeds.
 	if w.writer != nil {
 		w.writer.Flush()
+	}
+	if w.current != nil {
+		w.current.Close()
+		w.current = nil
+		w.writer = nil
 	}
 
 	// Read all entries, rewrite only those we want to keep
@@ -214,7 +220,9 @@ func (w *WAL) TruncateSuffix(keepIndex uint64) error {
 
 	// Remove all segment files and rewrite from scratch
 	for _, seg := range segments {
-		os.Remove(seg)
+		if err := os.Remove(seg); err != nil {
+			return fmt.Errorf("wal: remove segment %s: %w", seg, err)
+		}
 	}
 
 	w.current = nil

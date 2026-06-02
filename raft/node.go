@@ -205,6 +205,10 @@ func (n *Node) Propose(data []byte) (uint64, uint64, bool) {
 		go n.replicateToPeer(peerID)
 	}
 
+	// Check commit immediately: in a single-node cluster quorum is already
+	// satisfied, so the entry commits right here without waiting for peers.
+	n.maybeAdvanceCommit()
+
 	return entry.Index, entry.Term, true
 }
 
@@ -279,6 +283,12 @@ func (n *Node) startElection() {
 	// Count our own vote
 	votes := 1
 	needed := n.quorum()
+
+	// Single-node cluster: our own vote is sufficient — become leader immediately.
+	if votes >= needed {
+		n.becomeLeader()
+		return
+	}
 
 	// Ask all peers for votes concurrently (only peers, not self)
 	var voteMu sync.Mutex
