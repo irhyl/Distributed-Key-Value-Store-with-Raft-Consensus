@@ -8,7 +8,7 @@ Fault-tolerant across any minority of node failures. A 3-node cluster survives o
 
 ## How a write works
 
-```
+```text
 client PUT foo=bar
         │
         ▼
@@ -31,7 +31,7 @@ If the leader crashes after step 3, a new leader is elected and the entry is sti
 
 ## Architecture
 
-```
+```text
 ┌─────────────────────────────────────────────────┐
 │  KVServer                                       │
 │                                                 │
@@ -78,7 +78,7 @@ Two separate gRPC services on the same port: `RaftService` (peer-to-peer consens
 ## Components
 
 | Package | File | What it does |
-|---------|------|--------------|
+| ------- | ---- | ------------ |
 | `proto/` | `raftkv.proto` | All gRPC message types: Raft RPCs, KV ops, leader hints |
 | `wal/` | `wal.go` | Write-ahead log: CRC32 records, segment rollover, batch fsync |
 | `storage/` | `memtable.go` | Sorted in-memory buffer; O(log n) insert via binary search |
@@ -96,6 +96,23 @@ Two separate gRPC services on the same port: `RaftService` (peer-to-peer consens
 
 ---
 
+## Documentation
+
+Detailed write-ups for every layer are in [`docs/`](docs/):
+
+| File | Covers |
+| ---- | ------ |
+| [architecture.md](docs/architecture.md) | System overview, write/read/recovery data flows, threading model |
+| [raft.md](docs/raft.md) | Elections, log replication, fast rollback, Figure 8 current-term rule |
+| [wal.md](docs/wal.md) | Record format, segment files, fsync strategy, crash recovery |
+| [storage.md](docs/storage.md) | Memtable, SSTable layout, bloom filter, compaction algorithm |
+| [server.md](docs/server.md) | KVServer wiring, StateMachine apply loop, deduplication |
+| [client.md](docs/client.md) | CLI usage, leader redirection, retry logic |
+| [chaos-testing.md](docs/chaos-testing.md) | What the harness proves, failure scenarios, interpreting violations |
+| [design-decisions.md](docs/design-decisions.md) | 13 annotated decisions with alternatives and trade-offs |
+
+---
+
 ## Quick start
 
 ### Prerequisites
@@ -104,22 +121,23 @@ Two separate gRPC services on the same port: `RaftService` (peer-to-peer consens
 - `protoc` + plugins (only needed if you modify the `.proto` file)
 
 ```bash
-# Install protoc plugins
+# Install protoc plugins (one-time)
 go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
 go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
 
-# Regenerate proto stubs (only after editing raftkv.proto)
-protoc --go_out=. --go-grpc_out=. proto/raftkv.proto
+# Regenerate proto stubs — only needed after editing raftkv.proto
+make proto
 ```
 
 ### Build
 
 ```bash
-chmod +x scripts/build.sh
-./scripts/build.sh
+make build        # runs go mod tidy, then compiles both binaries
+make test         # runs all 28 tests across 4 packages
+make              # proto + tidy + test + build in one shot
 ```
 
-Runs all tests, then produces `./raftkv-server` and `./raftkv-cli`.
+Produces `./raftkv-server` and `./raftkv-cli`.
 
 ### Run a local 3-node cluster
 
@@ -184,31 +202,39 @@ The chaos harness starts a 3-node cluster, hammers it with concurrent writes acr
 
 ## Test coverage
 
-```
-wal/
-  TestWALWriteAndRead       — 100 entries survive close and reopen
-  TestWALTruncate           — suffix removal leaves correct entries
-  TestWALBatchAppend        — 200-entry batch, single fsync
-  BenchmarkAppend           — single-entry throughput (~50k–100k ops/s on SSD)
+```text
+wal/         (4 tests)
+  TestWALWriteAndRead              — 100 entries survive close and reopen
+  TestWALTruncate                  — suffix removal leaves correct entries
+  TestWALBatchAppend               — 200-entry batch, single fsync
+  BenchmarkAppend                  — single-entry throughput (~50k–100k ops/s on SSD)
 
-storage/
-  TestMemtableBasic         — put, get, delete, overwrite
-  TestMemtableSortOrder     — snapshot is always sorted
-  TestSSTableWriteRead      — write entries, read back including tombstones
-  TestBloomFilter           — no false negatives, ~1% false positive rate
-  TestEngineBasic           — end-to-end read and write
-  TestEngineRestart         — data survives engine close and reopen
-  TestEngineCompaction      — 50k entries, compaction runs, spot checks pass
-  BenchmarkEnginePut/Get    — throughput under realistic load
+storage/     (8 tests)
+  TestMemtableBasic                — put, get, delete, overwrite
+  TestMemtableSortOrder            — snapshot is always sorted
+  TestSSTableWriteRead             — write entries, read back including tombstones
+  TestBloomFilter                  — no false negatives, ~1% false positive rate
+  TestEngineBasic                  — end-to-end read and write
+  TestEngineRestart                — data survives engine close and reopen
+  TestEngineCompaction             — 50k entries, compaction runs, spot checks pass
+  BenchmarkEnginePut/Get           — throughput under realistic load
 
-raft/
-  TestElectionBasic         — exactly one leader elected in a 3-node cluster
-  TestElectionFiveNodes     — one leader in a 5-node cluster
+raft/        (7 tests)
+  TestElectionBasic                — exactly one leader elected in a 3-node cluster
+  TestElectionFiveNodes            — one leader in a 5-node cluster
   TestReelectionAfterLeaderFailure — new leader's term is strictly higher
-  TestLogReplication        — all nodes converge to same log and commitIndex
+  TestLogReplication               — all nodes converge to same log and commitIndex
   TestReplicationWithFollowerFailure — cluster commits with 2 of 3 nodes alive
-  TestNoCommitWithMinorityPartition — isolated leader never advances commitIndex
-  TestCommitNotification    — CommitCh delivers every entry exactly once, in order
+  TestNoCommitWithMinorityPartition  — isolated leader never advances commitIndex
+  TestCommitNotification           — CommitCh delivers every entry exactly once, in order
+
+server/      (6 tests)
+  TestPutAndGet                    — full round-trip: propose → commit → apply → read
+  TestDeduplication                — retry with same SeqNum does not re-apply
+  TestNonLeaderRejectsWrites       — isolated node returns ErrNotLeader immediately
+  TestMultipleWritesOrdered        — 20 writes apply in order; lastApplied == 20
+  TestDeleteRemovesKey             — DELETE makes key unreadable via tombstone
+  TestCommitNotificationUnblocksPropose — ProposeWrite returns only after commit
 ```
 
 ---
