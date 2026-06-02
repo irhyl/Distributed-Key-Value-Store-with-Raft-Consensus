@@ -258,4 +258,4 @@ A snapshot is a point-in-time serialisation of the entire LSM state plus the `la
 
 Snapshots are the most complex part of Raft. The leader must send snapshots to lagging followers (via `InstallSnapshot`), followers must apply snapshots to their state machines atomically, and both sides must handle chunked transfers for large snapshots. The correctness requirements are subtle enough that the Raft paper devotes a full section to them. Implementing it correctly without tests would be risky.
 
-The system is correct and complete without snapshots — it just has a startup time proportional to log length. Adding snapshots is a well-defined extension that doesn't require changing any existing code.
+The system is correct and complete without snapshots, it just has a startup time proportional to log length. Adding snapshots is a well-defined extension that doesn't require changing any existing code.
