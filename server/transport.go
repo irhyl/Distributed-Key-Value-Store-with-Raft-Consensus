@@ -93,9 +93,13 @@ func (t *GRPCTransport) getClient(peerID string) (pb.RaftServiceClient, error) {
 	// Connect without TLS; production should use mutual TLS.
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer dialCancel()
-	conn, err := grpc.DialContext(dialCtx, addr,
+	// DialContext+WithBlock is deprecated in favor of NewClient, but NewClient
+	// connects lazily on first RPC — we need dial itself to fail within this
+	// short timeout so an unreachable peer is detected quickly, not on the
+	// next heartbeat's RPC call.
+	conn, err := grpc.DialContext(dialCtx, addr, //nolint:staticcheck
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
+		grpc.WithBlock(), //nolint:staticcheck
 	)
 	if err != nil {
 		return nil, fmt.Errorf("transport: dial %s (%s): %w", peerID, addr, err)

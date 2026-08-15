@@ -76,7 +76,6 @@ type Node struct {
 	role        Role
 	leaderID    string // current leader's ID; updated on every valid AppendEntries
 	commitIndex uint64 // highest log index known to be committed
-	lastApplied uint64 // highest log index applied to state machine
 
 	// ── Leader-only volatile state (reinitialized after each election) ──
 	nextIndex  map[string]uint64 // for each peer: next log index to send

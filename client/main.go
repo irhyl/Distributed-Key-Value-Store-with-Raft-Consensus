@@ -199,9 +199,12 @@ func dial(addr string) (pb.KVServiceClient, *grpc.ClientConn, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
 	defer cancel()
 
-	conn, err := grpc.DialContext(ctx, addr,
+	// DialContext+WithBlock is deprecated in favor of NewClient, but NewClient
+	// connects lazily on first RPC — we want dial itself to fail within
+	// dialTimeout so callers get an immediate, actionable error.
+	conn, err := grpc.DialContext(ctx, addr, //nolint:staticcheck
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
+		grpc.WithBlock(), //nolint:staticcheck
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dial %s: %w", addr, err)
