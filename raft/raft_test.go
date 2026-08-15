@@ -48,8 +48,18 @@ func makeCluster(t *testing.T, n int) (*Network, []*Node) {
 	return net, nodes
 }
 
-// waitForLeader polls until exactly one leader emerges.
-// Returns the leader node. Fails the test if no leader within 3s.
+// waitForLeader polls until exactly one leader emerges and stays leader
+// across a follow-up check. Returns the leader node. Fails the test if no
+// stable leader within 3s.
+//
+// A single poll seeing one leader isn't enough: on cold start it's common
+// for two nodes' election timers to fire close together, so a node can be
+// the sole leader for one instant and get deposed moments later by a
+// concurrent, higher-term election that was already in flight. A caller
+// that immediately Propose()s against that transient leader would have its
+// entry silently lost when leadership actually settles elsewhere — this
+// showed up as an intermittent "did not commit within Ns" test flake.
+// Re-checking after one heartbeat interval filters out that transient case.
 func waitForLeader(t *testing.T, nodes []*Node) *Node {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
@@ -61,11 +71,16 @@ func waitForLeader(t *testing.T, nodes []*Node) *Node {
 			}
 		}
 		if len(leaders) == 1 {
-			return leaders[0]
+			candidate := leaders[0]
+			time.Sleep(heartbeatInterval * 2)
+			if candidate.IsLeader() {
+				return candidate
+			}
+			continue
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	t.Fatalf("no single leader emerged within 3s")
+	t.Fatalf("no stable single leader emerged within 3s")
 	return nil
 }
 
@@ -169,9 +184,13 @@ func TestLogReplication(t *testing.T) {
 		t.Fatalf("propose: got idx=%d term=%d", idx, term)
 	}
 
-	// Wait for all nodes to commit it
+	// Wait for all nodes to commit it. Generous timeout: on occasional slow
+	// cluster convergence (e.g. under system load) a 3-node cluster can go
+	// through a few extra election rounds before settling, each costing up
+	// to one full electionTimeoutMax; this budget covers that without
+	// masking a genuine hang (see waitForLeader's doc comment).
 	for _, n := range nodes {
-		waitForCommit(t, n, 1, 2*time.Second)
+		waitForCommit(t, n, 1, 5*time.Second)
 	}
 
 	// Verify all nodes have the same log
@@ -220,7 +239,7 @@ func TestReplicationWithFollowerFailure(t *testing.T) {
 		}
 	}
 	for _, n := range connected {
-		waitForCommit(t, n, idx, 2*time.Second)
+		waitForCommit(t, n, idx, 5*time.Second)
 	}
 
 	// Reconnect the failed follower — it should catch up

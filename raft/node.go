@@ -152,10 +152,16 @@ func (n *Node) Start() error {
 
 	n.resetElectionTimer()
 
+	// Capture recovered state for logging before starting n.run(): once the
+	// background goroutine is running, n.currentTerm/n.log may be mutated
+	// (e.g. by a near-instant election) without n.mu held here, which is a
+	// data race under the race detector even though it's log-line-only.
+	startTerm, startLogLen := n.currentTerm, len(n.log)-1
+
 	n.wg.Add(1)
 	go n.run()
 
-	log.Printf("[%s] started: term=%d log_len=%d", n.cfg.ID, n.currentTerm, len(n.log)-1)
+	log.Printf("[%s] started: term=%d log_len=%d", n.cfg.ID, startTerm, startLogLen)
 	return nil
 }
 
@@ -240,16 +246,27 @@ func (n *Node) GetState() (uint64, bool) {
 func (n *Node) run() {
 	defer n.wg.Done()
 	for {
+		// electionTimer/heartbeatTimer are mutated by RPC handlers and
+		// election goroutines under n.mu (see startElection, becomeLeader,
+		// becomeFollower, HandleAppendEntries). Snapshot the channel values
+		// under the same lock before selecting on them, rather than reading
+		// the fields directly in the select — the latter races with those
+		// writers even though the field values themselves change rarely.
+		n.mu.Lock()
+		electionC := n.electionTimerC()
+		heartbeatC := n.heartbeatTimerC()
+		n.mu.Unlock()
+
 		select {
 		case <-n.stopCh:
 			return
-		case <-n.electionTimerC():
+		case <-electionC:
 			n.mu.Lock()
 			if n.role != RoleLeader {
 				n.startElection()
 			}
 			n.mu.Unlock()
-		case <-n.heartbeatTimerC():
+		case <-heartbeatC:
 			n.mu.Lock()
 			if n.role == RoleLeader {
 				n.sendHeartbeats()
@@ -641,9 +658,8 @@ func (n *Node) maybeAdvanceCommit() {
 }
 
 // advanceCommitTo advances commitIndex to newCommit and notifies the application.
-// Entries are collected under the lock, then sent without holding it so that
-// RPC handlers are not blocked while the state machine drains the channel.
-// MUST be called with n.mu held.
+// MUST be called with n.mu held; it is kept held for the entire function,
+// including while sending on CommitCh (see note below).
 func (n *Node) advanceCommitTo(newCommit uint64) {
 	var toNotify []*LogEntry
 	for i := n.commitIndex + 1; i <= newCommit; i++ {
@@ -653,22 +669,23 @@ func (n *Node) advanceCommitTo(newCommit uint64) {
 	}
 	n.commitIndex = newCommit
 
-	if len(toNotify) == 0 {
-		return
-	}
-
-	// Release the lock while sending so RPC handlers can still acquire it.
-	// Entries are already committed; releasing here is safe.
-	n.mu.Unlock()
+	// Send while still holding n.mu. This function can be called concurrently
+	// from different goroutines (e.g. two peers' AppendEntries responses each
+	// advancing commit via maybeAdvanceCommit). If the lock were released
+	// before sending, two such calls could interleave their CommitCh sends
+	// out of index order; the consumer drops any entry whose index is <= its
+	// own lastApplied, so a lower-index entry arriving after a higher-index
+	// one would be silently lost, not just reordered — this previously caused
+	// a reproducible hang in server tests. CommitCh is generously buffered, so
+	// holding the lock here only blocks other RPC handlers in the pathological
+	// case where the application has fallen far behind.
 	for _, entry := range toNotify {
 		select {
 		case n.CommitCh <- CommitNotify{Entry: entry}:
 		case <-n.stopCh:
-			n.mu.Lock()
 			return
 		}
 	}
-	n.mu.Lock()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
