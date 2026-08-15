@@ -68,9 +68,19 @@ type Node struct {
 	cfg Config
 
 	// ── Persistent state (must survive crash — stored in WAL) ──
-	currentTerm uint64     // latest term this node has seen
-	votedFor    string     // candidateID we voted for in currentTerm (or "")
-	log         []*LogEntry // the replicated log (index 0 = dummy entry)
+	currentTerm uint64      // latest term this node has seen
+	votedFor    string      // candidateID we voted for in currentTerm (or "")
+	log         []*LogEntry // the replicated log tail still held in memory
+
+	// lastIncludedIndex/Term describe the most recent snapshot: everything up
+	// to and including this index has been compacted out of log/storage.
+	// log[0] is always a sentinel entry {Index: lastIncludedIndex, Term:
+	// lastIncludedTerm} — generalizing the pre-snapshot convention where
+	// log[0] was the fixed {0,0} dummy entry. Use logPos() to translate a
+	// Raft log index into a position in log; never index log[] directly with
+	// a raw Raft index.
+	lastIncludedIndex uint64
+	lastIncludedTerm  uint64
 
 	// ── Volatile state (reconstructed after crash) ──
 	role        Role
@@ -146,6 +156,25 @@ func NewNode(cfg Config, transport Transport, storage PersistentState) *Node {
 
 // Start loads persisted state and begins the Raft protocol.
 func (n *Node) Start() error {
+	// Recover snapshot metadata first, if any. This seeds where our
+	// in-memory log begins so we don't need entries the snapshot already
+	// covers, and lets commitIndex start from the snapshot's index instead
+	// of 0 — replaying already-committed history on every restart is exactly
+	// what snapshotting exists to avoid. The snapshot bytes themselves are
+	// NOT reapplied here: this node's own storage.Engine already reflects
+	// this state (or newer) from its own on-disk SSTables. The bytes only
+	// matter when a peer needs them via InstallSnapshot.
+	_, lastIncludedIndex, lastIncludedTerm, err := n.storage.LoadSnapshot()
+	if err != nil {
+		return fmt.Errorf("raft: load snapshot: %w", err)
+	}
+	if lastIncludedIndex > 0 {
+		n.lastIncludedIndex = lastIncludedIndex
+		n.lastIncludedTerm = lastIncludedTerm
+		n.log = []*LogEntry{{Index: lastIncludedIndex, Term: lastIncludedTerm}}
+		n.commitIndex = lastIncludedIndex
+	}
+
 	// Recover persisted hard state
 	term, votedFor, err := n.storage.LoadHardState()
 	if err != nil {
@@ -154,7 +183,7 @@ func (n *Node) Start() error {
 	n.currentTerm = term
 	n.votedFor = votedFor
 
-	// Recover log
+	// Recover log entries after the snapshot baseline (if any)
 	entries, err := n.storage.LoadEntries()
 	if err != nil {
 		return fmt.Errorf("raft: load log: %w", err)
@@ -167,12 +196,12 @@ func (n *Node) Start() error {
 	// background goroutine is running, n.currentTerm/n.log may be mutated
 	// (e.g. by a near-instant election) without n.mu held here, which is a
 	// data race under the race detector even though it's log-line-only.
-	startTerm, startLogLen := n.currentTerm, len(n.log)-1
+	startTerm, startLastIndex := n.currentTerm, n.lastLogIndex()
 
 	n.wg.Add(1)
 	go n.run()
 
-	log.Printf("[%s] started: term=%d log_len=%d", n.cfg.ID, startTerm, startLogLen)
+	log.Printf("[%s] started: term=%d last_log_index=%d", n.cfg.ID, startTerm, startLastIndex)
 	return nil
 }
 
@@ -468,25 +497,38 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 			resp.ConflictTerm = 0
 			return resp
 		}
-		if n.log[req.PrevLogIndex].Term != req.PrevLogTerm {
-			// Term mismatch — find the first index of the conflicting term for fast rollback
-			conflictTerm := n.log[req.PrevLogIndex].Term
-			resp.ConflictTerm = conflictTerm
-			resp.ConflictIndex = req.PrevLogIndex
-			for resp.ConflictIndex > 1 && n.log[resp.ConflictIndex-1].Term == conflictTerm {
-				resp.ConflictIndex--
+		if pos, ok := n.logPos(req.PrevLogIndex); ok {
+			if n.log[pos].Term != req.PrevLogTerm {
+				// Term mismatch — find the first index of the conflicting term for fast rollback
+				conflictTerm := n.log[pos].Term
+				resp.ConflictTerm = conflictTerm
+				resp.ConflictIndex = req.PrevLogIndex
+				for resp.ConflictIndex > n.lastIncludedIndex+1 {
+					p, ok := n.logPos(resp.ConflictIndex - 1)
+					if !ok || n.log[p].Term != conflictTerm {
+						break
+					}
+					resp.ConflictIndex--
+				}
+				return resp
 			}
-			return resp
 		}
+		// else: PrevLogIndex is at or before our snapshot baseline. Everything
+		// up to lastIncludedIndex is committed by construction (a snapshot can
+		// only cover applied entries), so the consistency check trivially
+		// passes — fall through to appending entries.
 	}
 
 	// Append any new entries, truncating conflicting entries first
 	for i, entry := range req.Entries {
 		idx := req.PrevLogIndex + uint64(i) + 1
-		if idx < uint64(len(n.log)) {
-			if n.log[idx].Term != entry.Term {
+		if idx <= n.lastIncludedIndex {
+			continue // already compacted into our snapshot — nothing to do
+		}
+		if pos, ok := n.logPos(idx); ok {
+			if n.log[pos].Term != entry.Term {
 				// Conflict: truncate our log here and append from leader
-				n.log = n.log[:idx]
+				n.log = n.log[:pos]
 				if err := n.storage.TruncateSuffix(idx - 1); err != nil {
 					log.Printf("[%s] ERROR: truncate log at %d: %v", n.cfg.ID, idx-1, err)
 				}
@@ -568,13 +610,19 @@ func (n *Node) replicateToPeer(peerID string) {
 	// Collect entries to send (from nextIdx to end of log)
 	var entries []*LogEntry
 	if nextIdx <= n.lastLogIndex() {
-		entries = make([]*LogEntry, len(n.log[nextIdx:]))
-		copy(entries, n.log[nextIdx:])
+		if pos, ok := n.logPos(nextIdx); ok {
+			entries = make([]*LogEntry, len(n.log[pos:]))
+			copy(entries, n.log[pos:])
+		}
+		// else: nextIdx has been compacted away — the caller (sendHeartbeats/
+		// run) is expected to send a snapshot instead in this case.
 	}
 
 	var prevLogTerm uint64
-	if prevLogIndex > 0 && prevLogIndex < uint64(len(n.log)) {
-		prevLogTerm = n.log[prevLogIndex].Term
+	if prevLogIndex > 0 {
+		if pos, ok := n.logPos(prevLogIndex); ok {
+			prevLogTerm = n.log[pos].Term
+		}
 	}
 
 	req := &pb.AppendEntriesRequest{
@@ -620,8 +668,8 @@ func (n *Node) replicateToPeer(peerID string) {
 		if resp.ConflictTerm > 0 {
 			// Find the last entry in our log with ConflictTerm
 			newNext := resp.ConflictIndex
-			for i := n.lastLogIndex(); i >= 1; i-- {
-				if n.log[i].Term == resp.ConflictTerm {
+			for i := n.lastLogIndex(); i > n.lastIncludedIndex; i-- {
+				if pos, ok := n.logPos(i); ok && n.log[pos].Term == resp.ConflictTerm {
 					newNext = i + 1
 					break
 				}
@@ -630,8 +678,8 @@ func (n *Node) replicateToPeer(peerID string) {
 		} else {
 			n.nextIndex[peerID] = resp.ConflictIndex
 		}
-		if n.nextIndex[peerID] < 1 {
-			n.nextIndex[peerID] = 1
+		if n.nextIndex[peerID] < n.lastIncludedIndex+1 {
+			n.nextIndex[peerID] = n.lastIncludedIndex + 1
 		}
 
 		// Immediately retry with the corrected nextIndex
@@ -646,7 +694,8 @@ func (n *Node) maybeAdvanceCommit() {
 	for idx := n.lastLogIndex(); idx > n.commitIndex; idx-- {
 		// Only commit entries from the current term
 		// (Raft's rule to prevent the "leader completeness" violation)
-		if n.log[idx].Term != n.currentTerm {
+		pos, ok := n.logPos(idx)
+		if !ok || n.log[pos].Term != n.currentTerm {
 			continue
 		}
 
@@ -674,8 +723,8 @@ func (n *Node) maybeAdvanceCommit() {
 func (n *Node) advanceCommitTo(newCommit uint64) {
 	var toNotify []*LogEntry
 	for i := n.commitIndex + 1; i <= newCommit; i++ {
-		if i < uint64(len(n.log)) {
-			toNotify = append(toNotify, n.log[i])
+		if pos, ok := n.logPos(i); ok {
+			toNotify = append(toNotify, n.log[pos])
 		}
 	}
 	n.commitIndex = newCommit
@@ -701,13 +750,30 @@ func (n *Node) advanceCommitTo(newCommit uint64) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// logPos translates a Raft log index into a position in n.log, accounting
+// for entries already compacted away into a snapshot. Returns ok=false if
+// index is before lastIncludedIndex (compacted away, no longer in memory —
+// see maybeSendSnapshot/HandleInstallSnapshot for how that case is handled)
+// or beyond what we currently have. Every read of n.log by Raft index
+// (never by raw slice position) MUST go through this.
+func (n *Node) logPos(index uint64) (int, bool) {
+	if index < n.lastIncludedIndex {
+		return 0, false
+	}
+	pos := int(index - n.lastIncludedIndex)
+	if pos >= len(n.log) {
+		return 0, false
+	}
+	return pos, true
+}
+
 func (n *Node) lastLogIndex() uint64 {
-	return uint64(len(n.log) - 1)
+	return n.lastIncludedIndex + uint64(len(n.log)-1)
 }
 
 func (n *Node) lastLogTerm() uint64 {
 	if len(n.log) == 0 {
-		return 0
+		return n.lastIncludedTerm
 	}
 	return n.log[len(n.log)-1].Term
 }

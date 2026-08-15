@@ -102,6 +102,53 @@ func waitForCommit(t *testing.T, node *Node, targetIndex uint64, timeout time.Du
 
 // ── Tests ──────────────────────────────────────────────────────────────────────
 
+// TestNodeSeedsFromSnapshotOnStart verifies that a node whose PersistentState
+// already has a saved snapshot picks up lastIncludedIndex/Term and seeds
+// commitIndex from it on Start(), instead of always starting fresh at 0 —
+// the whole point of a snapshot is to skip replaying history it covers.
+func TestNodeSeedsFromSnapshotOnStart(t *testing.T) {
+	state := newMemState()
+	if err := state.SaveSnapshot([]byte("fake-snapshot-data"), 42, 5); err != nil {
+		t.Fatalf("seed snapshot: %v", err)
+	}
+	if err := state.AppendEntries([]*LogEntry{
+		{Index: 43, Term: 6},
+		{Index: 44, Term: 6},
+	}); err != nil {
+		t.Fatalf("seed entries: %v", err)
+	}
+
+	net := NewNetwork()
+	node := NewNode(Config{ID: "node1", Peers: map[string]string{}}, net.TransportFor("node1"), state)
+	net.Add("node1", node)
+	if err := node.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	defer node.Stop()
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+
+	if node.lastIncludedIndex != 42 || node.lastIncludedTerm != 5 {
+		t.Fatalf("lastIncludedIndex/Term: got %d/%d, want 42/5",
+			node.lastIncludedIndex, node.lastIncludedTerm)
+	}
+	if node.commitIndex != 42 {
+		t.Fatalf("commitIndex: got %d, want 42 (seeded from snapshot)", node.commitIndex)
+	}
+	if got := node.lastLogIndex(); got != 44 {
+		t.Fatalf("lastLogIndex: got %d, want 44", got)
+	}
+	if got := node.lastLogTerm(); got != 6 {
+		t.Fatalf("lastLogTerm: got %d, want 6", got)
+	}
+	pos, ok := node.logPos(42)
+	if !ok || node.log[pos].Term != 5 {
+		t.Fatalf("logPos(42): pos=%d ok=%v term=%d, want a valid position with term=5",
+			pos, ok, node.log[pos].Term)
+	}
+}
+
 // TestElectionBasic verifies that a 3-node cluster elects exactly one leader.
 func TestElectionBasic(t *testing.T) {
 	_, nodes := makeCluster(t, 3)
