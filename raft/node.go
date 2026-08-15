@@ -111,6 +111,17 @@ type PersistentState interface {
 	AppendEntries(entries []*LogEntry) error
 	LoadEntries() ([]*LogEntry, error)
 	TruncateSuffix(keepIndex uint64) error
+
+	// SaveSnapshot durably persists snapshot data along with the Raft index
+	// and term it covers. Must be atomic with respect to crashes: a reader
+	// must never observe a partially-written snapshot.
+	SaveSnapshot(data []byte, lastIncludedIndex, lastIncludedTerm uint64) error
+	// LoadSnapshot returns the most recently saved snapshot, or a nil data
+	// slice with lastIncludedIndex 0 if none has ever been saved.
+	LoadSnapshot() (data []byte, lastIncludedIndex, lastIncludedTerm uint64, err error)
+	// TruncatePrefix removes all log entries with index <= discardIndex,
+	// called after a snapshot covering them has been durably saved.
+	TruncatePrefix(discardIndex uint64) error
 }
 
 // NewNode creates a new Raft node. Call Start() to begin participating.

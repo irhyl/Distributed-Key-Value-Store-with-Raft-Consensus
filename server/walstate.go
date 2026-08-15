@@ -11,6 +11,7 @@
 package server
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -97,4 +98,51 @@ func (ws *walState) LoadEntries() ([]*pb.LogEntry, error) {
 // Called when a follower must roll back conflicting entries.
 func (ws *walState) TruncateSuffix(keepIndex uint64) error {
 	return ws.w.TruncateSuffix(keepIndex)
+}
+
+// SaveSnapshot persists snapshot data plus the Raft index/term it covers,
+// atomically (temp file + rename, same pattern as SaveHardState). The index
+// and term are packed into the same file as the data itself rather than a
+// separate metadata file, so a crash between two atomic renames can't leave
+// them pointing at different snapshots.
+func (ws *walState) SaveSnapshot(data []byte, lastIncludedIndex, lastIncludedTerm uint64) error {
+	buf := make([]byte, 16+len(data))
+	binary.LittleEndian.PutUint64(buf[0:8], lastIncludedIndex)
+	binary.LittleEndian.PutUint64(buf[8:16], lastIncludedTerm)
+	copy(buf[16:], data)
+
+	tmpPath := filepath.Join(ws.dir, "snapshot.tmp")
+	finalPath := filepath.Join(ws.dir, "snapshot.bin")
+
+	if err := os.WriteFile(tmpPath, buf, 0644); err != nil {
+		return fmt.Errorf("walstate: write snapshot tmp: %w", err)
+	}
+	return os.Rename(tmpPath, finalPath) // atomic
+}
+
+// LoadSnapshot reads the persisted snapshot, if any.
+// Returns a nil data slice and lastIncludedIndex 0 if no snapshot has ever
+// been saved (fresh node, or one that has never compacted its log).
+func (ws *walState) LoadSnapshot() ([]byte, uint64, uint64, error) {
+	path := filepath.Join(ws.dir, "snapshot.bin")
+	buf, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil, 0, 0, nil
+	}
+	if err != nil {
+		return nil, 0, 0, fmt.Errorf("walstate: read snapshot: %w", err)
+	}
+	if len(buf) < 16 {
+		return nil, 0, 0, fmt.Errorf("walstate: snapshot file truncated (%d bytes)", len(buf))
+	}
+	lastIncludedIndex := binary.LittleEndian.Uint64(buf[0:8])
+	lastIncludedTerm := binary.LittleEndian.Uint64(buf[8:16])
+	data := buf[16:]
+	return data, lastIncludedIndex, lastIncludedTerm, nil
+}
+
+// TruncatePrefix removes all log entries with index <= discardIndex.
+// Called after a snapshot covering them has been durably saved.
+func (ws *walState) TruncatePrefix(discardIndex uint64) error {
+	return ws.w.TruncatePrefix(discardIndex)
 }

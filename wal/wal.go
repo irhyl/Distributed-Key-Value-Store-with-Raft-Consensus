@@ -248,6 +248,76 @@ func (w *WAL) TruncateSuffix(keepIndex uint64) error {
 	return w.current.Sync()
 }
 
+// TruncatePrefix removes all entries with index <= discardIndex.
+// Called after a Raft snapshot has been taken: everything up to and
+// including discardIndex is now captured in the snapshot, so replaying it
+// from the WAL on restart is no longer necessary. Mirrors TruncateSuffix's
+// close-before-remove handling (required on Windows, where an open file
+// cannot be deleted) and rewrite-from-scratch approach.
+func (w *WAL) TruncatePrefix(discardIndex uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.writer != nil {
+		w.writer.Flush()
+	}
+	if w.current != nil {
+		w.current.Close()
+		w.current = nil
+		w.writer = nil
+	}
+
+	// Read all entries, rewrite only those we want to keep
+	segments, _ := filepath.Glob(filepath.Join(w.dir, "*.wal"))
+	var keep []*pb.LogEntry
+	for _, seg := range segments {
+		entries, err := readSegment(seg)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if e.Index > discardIndex {
+				keep = append(keep, e)
+			}
+		}
+	}
+
+	// Remove all segment files and rewrite from scratch
+	for _, seg := range segments {
+		if err := os.Remove(seg); err != nil {
+			return fmt.Errorf("wal: remove segment %s: %w", seg, err)
+		}
+	}
+
+	w.current = nil
+	w.size = 0
+	// Even with nothing left to keep, the log logically continues from
+	// discardIndex — the next Append() picks up at discardIndex+1, it does
+	// not restart from 1. Set this now; the loop below overwrites it with
+	// the actual last kept index if there is one.
+	w.lastIndex = discardIndex
+
+	if err := w.createSegment(discardIndex + 1); err != nil {
+		return err
+	}
+
+	for _, e := range keep {
+		data, err := proto.Marshal(e)
+		if err != nil {
+			return fmt.Errorf("wal: truncate marshal entry %d: %w", e.Index, err)
+		}
+		if err := w.writeRecord(data); err != nil {
+			return fmt.Errorf("wal: truncate rewrite entry %d: %w", e.Index, err)
+		}
+		w.lastIndex = e.Index
+	}
+
+	if err := w.writer.Flush(); err != nil {
+		return fmt.Errorf("wal: flush after truncate prefix: %w", err)
+	}
+	return w.current.Sync()
+}
+
 // LastIndex returns the index of the most recent entry in the WAL.
 func (w *WAL) LastIndex() uint64 {
 	w.mu.Lock()
