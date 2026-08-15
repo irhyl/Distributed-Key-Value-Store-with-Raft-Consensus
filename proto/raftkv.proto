@@ -86,7 +86,8 @@ message InstallSnapshotRequest {
 }
 
 message InstallSnapshotResponse {
-  uint64 term = 1;
+  uint64 term    = 1;
+  bool   success = 2; // false if this chunk was rejected (stale snapshot or offset mismatch)
 }
 
 // ─────────────────────────────────────────────
