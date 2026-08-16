@@ -61,7 +61,7 @@ type StateMachine struct {
 	wg     sync.WaitGroup
 }
 
-// NewStateMachine creates a state machine backed by engine, consuming from node.CommitCh.
+// NewStateMachine creates a state machine backed by engine, consuming from node.ApplyCh.
 func NewStateMachine(node *raft.Node, engine *storage.Engine) *StateMachine {
 	sm := &StateMachine{
 		engine:  engine,
@@ -148,26 +148,42 @@ func (sm *StateMachine) ReadValue(key string) ([]byte, bool, error) {
 
 // ── Apply loop ────────────────────────────────────────────────────────────────
 
-// applyLoop is the single goroutine that consumes CommitCh and calls apply().
-// Single-threaded application is deliberate: it ensures entries are applied
-// in strict log order, which is required for state machine safety.
+// applyLoop is the single goroutine that consumes ApplyCh and calls apply()
+// or applySnapshot(). Single-threaded application is deliberate: it ensures
+// entries are applied in strict log order, which is required for state
+// machine safety, and that a snapshot install never races with an in-flight
+// apply() of a normal entry.
 func (sm *StateMachine) applyLoop() {
 	defer sm.wg.Done()
 	for {
 		select {
-		case notify := <-sm.node.CommitCh:
-			sm.apply(notify.Entry)
+		case msg := <-sm.node.ApplyCh:
+			sm.dispatch(msg)
 		case <-sm.stopCh:
-			// Drain any remaining commits before exiting
+			// Drain any remaining messages before exiting
 			for {
 				select {
-				case notify := <-sm.node.CommitCh:
-					sm.apply(notify.Entry)
+				case msg := <-sm.node.ApplyCh:
+					sm.dispatch(msg)
 				default:
 					return
 				}
 			}
 		}
+	}
+}
+
+// dispatch routes a single ApplyCh message to the right handler.
+func (sm *StateMachine) dispatch(msg raft.ApplyMsg) {
+	switch {
+	case msg.CommandValid:
+		sm.apply(msg.Entry)
+	case msg.SnapshotValid:
+		// TODO(snapshotting): install msg.Snapshot into the storage engine
+		// and reset dedup/pending state. Not yet wired up — a peer that
+		// falls behind and receives InstallSnapshot from the leader will
+		// have this message dropped here rather than actually catching up.
+		log.Printf("[statemachine] received snapshot up to index %d (not yet applied)", msg.SnapshotIndex)
 	}
 }
 

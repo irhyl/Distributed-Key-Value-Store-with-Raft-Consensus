@@ -259,3 +259,23 @@ A snapshot is a point-in-time serialisation of the entire LSM state plus the `la
 Snapshots are the most complex part of Raft. The leader must send snapshots to lagging followers (via `InstallSnapshot`), followers must apply snapshots to their state machines atomically, and both sides must handle chunked transfers for large snapshots. The correctness requirements are subtle enough that the Raft paper devotes a full section to them. Implementing it correctly without tests would be risky.
 
 The system is correct and complete without snapshots, it just has a startup time proportional to log length. Adding snapshots is a well-defined extension that doesn't require changing any existing code.
+
+---
+
+## No PreVote
+
+**Decision:** a follower's election timer fires unconditionally when it hasn't heard from a leader, immediately incrementing `currentTerm` and becoming a candidate.
+
+**The cost:**
+
+A node that's partitioned from the rest of the cluster — no leader reachable, no peers reachable — still has its election timer running. With nobody to reset it, that timer fires every 150-300ms indefinitely, and `currentTerm` climbs by one each time even though the node can never actually win (it never receives a single vote). The longer it stays partitioned, the further its term drifts from the rest of the cluster's.
+
+This becomes a real liveness problem on reconnection, not just a wasted-CPU one: the rejoining node's inflated term is higher than the current legitimate leader's, so the leader's heartbeats — carrying its own, lower, genuinely-in-use term — get rejected outright by `HandleAppendEntries`'s stale-term check. The rejoining node's election timer is never reset by a real leader as a result, so it tries again, forcing the leader to adopt the higher term and step down for a fresh election — one the rejoining node still can't win, since `candidateLogUpToDate` correctly rejects its stale log. This repeats, closing the term gap by roughly one per cycle, until the cluster is disrupted enough times to catch up. Confirmed directly while testing snapshot catch-up (see `TestInstallSnapshotChunkedTransferApplies` in `raft/raft_test.go`): a follower disconnected for even a few seconds destabilized a fully-connected 2-node remainder for 10+ seconds after reconnecting.
+
+**What PreVote would fix:**
+
+Before actually incrementing its term, a candidate first runs a non-binding "pre-vote" round: would peers vote for me if I were to start a real election? A partitioned node's pre-vote requests never reach anyone, so it never learns it *could* win — and since it never learns that, it never bumps its real term while alone. `currentTerm` only advances once an actual election starts, which only happens after a majority has already signaled they'd support it. Reconnecting is then a non-event: the node's term is still close to the cluster's, so no disruptive step-down cascade follows.
+
+**Why it's not implemented:**
+
+It's an additive protocol change (a new RPC or a flag on the existing one, plus a candidate-side pre-check) that's out of scope for the snapshotting work that surfaced it. Nothing here is unsafe without it — the term-convergence cycle above always terminates, and no Raft safety property depends on PreVote — it's purely a liveness/availability improvement for the reconnection case.

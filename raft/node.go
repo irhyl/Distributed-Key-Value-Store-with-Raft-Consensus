@@ -43,14 +43,34 @@ const (
 	// Leader sends heartbeats at this interval to prevent followers from timing out.
 	// Must be << electionTimeoutMin.
 	heartbeatInterval = 50 * time.Millisecond
+
+	// snapshotChunkSize bounds a single InstallSnapshot RPC's payload so a
+	// large snapshot doesn't block a peer connection with one huge message.
+	snapshotChunkSize = 1 << 20 // 1MB
 )
 
 // LogEntry wraps the proto type with a convenience constructor.
 type LogEntry = pb.LogEntry
 
-// CommitNotify is sent on the commitCh whenever entries are newly committed.
-type CommitNotify struct {
-	Entry *LogEntry
+// ApplyMsg is sent on ApplyCh whenever there's something new for the
+// application layer to apply: either a newly committed log entry, or an
+// installed snapshot that should replace all prior state. Shape modeled on
+// the standard MIT 6.5840 Raft lab ApplyMsg.
+type ApplyMsg struct {
+	CommandValid bool
+	Entry        *LogEntry
+
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotIndex uint64
+	SnapshotTerm  uint64
+}
+
+// snapshotRecvState tracks reassembly of a chunked InstallSnapshot transfer.
+type snapshotRecvState struct {
+	lastIncludedIndex uint64
+	lastIncludedTerm  uint64
+	data              []byte
 }
 
 // Config holds the static configuration for a Raft node.
@@ -61,8 +81,8 @@ type Config struct {
 }
 
 // Node is a single Raft participant.
-// It communicates with peers via the Transport interface and
-// notifies the application layer of committed entries via CommitCh.
+// It communicates with peers via the Transport interface and notifies the
+// application layer of committed entries and installed snapshots via ApplyCh.
 type Node struct {
 	mu  sync.Mutex
 	cfg Config
@@ -87,6 +107,10 @@ type Node struct {
 	leaderID    string // current leader's ID; updated on every valid AppendEntries
 	commitIndex uint64 // highest log index known to be committed
 
+	// recvSnapshot accumulates chunks of an in-progress InstallSnapshot
+	// transfer from the leader. nil except mid-transfer.
+	recvSnapshot *snapshotRecvState
+
 	// ── Leader-only volatile state (reinitialized after each election) ──
 	nextIndex  map[string]uint64 // for each peer: next log index to send
 	matchIndex map[string]uint64 // for each peer: highest index known replicated
@@ -100,8 +124,8 @@ type Node struct {
 	heartbeatTimer *time.Timer
 
 	// ── Channels ──
-	CommitCh chan CommitNotify // application reads committed entries from here
-	stopCh   chan struct{}
+	ApplyCh chan ApplyMsg // application reads committed entries / snapshots from here
+	stopCh  chan struct{}
 	wg       sync.WaitGroup
 }
 
@@ -141,7 +165,7 @@ func NewNode(cfg Config, transport Transport, storage PersistentState) *Node {
 		role:      RoleFollower,
 		transport: transport,
 		storage:   storage,
-		CommitCh:  make(chan CommitNotify, 4096),
+		ApplyCh:   make(chan ApplyMsg, 4096),
 		stopCh:    make(chan struct{}),
 		nextIndex:  make(map[string]uint64),
 		matchIndex: make(map[string]uint64),
@@ -570,17 +594,131 @@ func (n *Node) HandleInstallSnapshot(req *pb.InstallSnapshotRequest) *pb.Install
 	resp := &pb.InstallSnapshotResponse{Term: n.currentTerm}
 
 	if req.Term < n.currentTerm {
-		return resp
+		return resp // Success = false
 	}
 	if req.Term > n.currentTerm {
 		n.becomeFollower(req.Term)
+	} else {
+		// A snapshot from a valid leader is also proof of life, same as a
+		// heartbeat — reset our election timer so we don't start a spurious
+		// election while a (possibly large) transfer is in progress.
+		n.role = RoleFollower
+		n.resetElectionTimer()
+	}
+	n.leaderID = req.LeaderId
+	resp.Term = n.currentTerm
+
+	// Reject a snapshot that's no newer than what we already have. Without
+	// this, a retried or reordered RPC (e.g. after a leader change) could
+	// regress a follower that has already caught up normally via
+	// AppendEntries. Success=true here because nothing is actually wrong —
+	// we're just already ahead of or at this snapshot.
+	if req.LastIncludedIndex <= n.lastIncludedIndex {
+		resp.Success = true
+		return resp
 	}
 
-	// In a full implementation: write req.Data to disk, then apply the snapshot
-	// to the state machine. For now we just update our term tracking.
-	// The snapshot application logic lives in server/statemachine.go.
-	resp.Term = n.currentTerm
+	if req.Offset == 0 {
+		// Start (or restart) a transfer — reset the reassembly buffer. A
+		// leader restarting a failed transfer always begins at offset 0.
+		n.recvSnapshot = &snapshotRecvState{
+			lastIncludedIndex: req.LastIncludedIndex,
+			lastIncludedTerm:  req.LastIncludedTerm,
+		}
+	}
+	if n.recvSnapshot == nil ||
+		n.recvSnapshot.lastIncludedIndex != req.LastIncludedIndex ||
+		uint64(len(n.recvSnapshot.data)) != req.Offset {
+		// Chunk doesn't fit where we expect (no transfer in progress, wrong
+		// snapshot, or offset mismatch) — reject rather than mis-concatenate.
+		// The leader will notice via Success=false and restart from offset 0.
+		return resp
+	}
+
+	n.recvSnapshot.data = append(n.recvSnapshot.data, req.Data...)
+	resp.Success = true
+
+	if !req.Done {
+		return resp
+	}
+
+	// Final chunk: install it.
+	data := n.recvSnapshot.data
+	lastIncludedIndex := n.recvSnapshot.lastIncludedIndex
+	lastIncludedTerm := n.recvSnapshot.lastIncludedTerm
+	n.recvSnapshot = nil
+
+	if err := n.storage.SaveSnapshot(data, lastIncludedIndex, lastIncludedTerm); err != nil {
+		log.Printf("[%s] ERROR: save installed snapshot: %v", n.cfg.ID, err)
+		resp.Success = false
+		return resp
+	}
+	if err := n.storage.TruncatePrefix(lastIncludedIndex); err != nil {
+		log.Printf("[%s] ERROR: truncate prefix after installing snapshot: %v", n.cfg.ID, err)
+	}
+
+	// Conservative simplification vs. the Raft paper's "retain matching
+	// suffix" optimization (§7): discard the entire in-memory log rather
+	// than keeping any entries we already have that happen to match the
+	// leader's. Simpler and always correct, at the cost of possibly
+	// re-replicating a few entries we didn't strictly need to.
+	n.log = []*LogEntry{{Index: lastIncludedIndex, Term: lastIncludedTerm}}
+	n.lastIncludedIndex = lastIncludedIndex
+	n.lastIncludedTerm = lastIncludedTerm
+	if lastIncludedIndex > n.commitIndex {
+		n.commitIndex = lastIncludedIndex
+	}
+
+	// Notify the application layer under the same lock advanceCommitTo uses,
+	// so all ApplyCh producers share one total order.
+	select {
+	case n.ApplyCh <- ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      data,
+		SnapshotIndex: lastIncludedIndex,
+		SnapshotTerm:  lastIncludedTerm,
+	}:
+	case <-n.stopCh:
+	}
+
 	return resp
+}
+
+// CompactLog persists a snapshot covering entries up to and including
+// lastIncludedIndex, then discards them from the in-memory log and durable
+// log storage. Called by the application layer once it has produced a
+// snapshot of its own state as of that index — Node has no opinion on when
+// to snapshot, only how to record that one happened.
+func (n *Node) CompactLog(data []byte, lastIncludedIndex, lastIncludedTerm uint64) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if lastIncludedIndex <= n.lastIncludedIndex {
+		return nil // stale — we've already compacted at least this far
+	}
+	if lastIncludedIndex > n.commitIndex {
+		return fmt.Errorf("raft: cannot compact past commitIndex (%d > %d)", lastIncludedIndex, n.commitIndex)
+	}
+
+	if err := n.storage.SaveSnapshot(data, lastIncludedIndex, lastIncludedTerm); err != nil {
+		return fmt.Errorf("raft: save snapshot: %w", err)
+	}
+	if err := n.storage.TruncatePrefix(lastIncludedIndex); err != nil {
+		return fmt.Errorf("raft: truncate prefix: %w", err)
+	}
+
+	if pos, ok := n.logPos(lastIncludedIndex); ok {
+		// n.log[pos] is the real entry at lastIncludedIndex; its Index/Term
+		// already match what a fresh sentinel would hold, so it becomes the
+		// new log[0] simply by slicing — no need to construct a new one.
+		n.log = n.log[pos:]
+	} else {
+		n.log = []*LogEntry{{Index: lastIncludedIndex, Term: lastIncludedTerm}}
+	}
+	n.lastIncludedIndex = lastIncludedIndex
+	n.lastIncludedTerm = lastIncludedTerm
+
+	return nil
 }
 
 // ── Log replication ───────────────────────────────────────────────────────────
@@ -605,6 +743,14 @@ func (n *Node) replicateToPeer(peerID string) {
 	}
 
 	nextIdx := n.nextIndex[peerID]
+	if nextIdx <= n.lastIncludedIndex {
+		// The peer needs entries we've already compacted away — send a
+		// snapshot instead of AppendEntries.
+		n.mu.Unlock()
+		n.sendSnapshotToPeer(peerID)
+		return
+	}
+
 	prevLogIndex := nextIdx - 1
 
 	// Collect entries to send (from nextIdx to end of log)
@@ -614,8 +760,6 @@ func (n *Node) replicateToPeer(peerID string) {
 			entries = make([]*LogEntry, len(n.log[pos:]))
 			copy(entries, n.log[pos:])
 		}
-		// else: nextIdx has been compacted away — the caller (sendHeartbeats/
-		// run) is expected to send a snapshot instead in this case.
 	}
 
 	var prevLogTerm uint64
@@ -687,6 +831,83 @@ func (n *Node) replicateToPeer(peerID string) {
 	}
 }
 
+// sendSnapshotToPeer sends our current snapshot to a peer whose nextIndex
+// has fallen at or behind lastIncludedIndex, in fixed-size chunks via
+// InstallSnapshot. Called from replicateToPeer instead of the normal
+// AppendEntries path in that case.
+func (n *Node) sendSnapshotToPeer(peerID string) {
+	n.mu.Lock()
+	if n.role != RoleLeader {
+		n.mu.Unlock()
+		return
+	}
+	term := n.currentTerm
+	lastIncludedIndex := n.lastIncludedIndex
+	lastIncludedTerm := n.lastIncludedTerm
+	n.mu.Unlock()
+
+	data, savedIndex, _, err := n.storage.LoadSnapshot()
+	if err != nil {
+		log.Printf("[%s] ERROR: load snapshot to send to %s: %v", n.cfg.ID, peerID, err)
+		return
+	}
+	if savedIndex != lastIncludedIndex {
+		// Storage's saved snapshot doesn't match what we read under the lock
+		// above (a newer CompactLog raced in) — bail and let the next
+		// heartbeat retry with up-to-date values.
+		return
+	}
+
+	offset := 0
+	for {
+		end := offset + snapshotChunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		done := end >= len(data)
+
+		req := &pb.InstallSnapshotRequest{
+			Term:              term,
+			LeaderId:          n.cfg.ID,
+			LastIncludedIndex: lastIncludedIndex,
+			LastIncludedTerm:  lastIncludedTerm,
+			Offset:            uint64(offset),
+			Data:              data[offset:end],
+			Done:              done,
+		}
+		resp, err := n.transport.InstallSnapshot(peerID, req)
+		if err != nil {
+			return // peer unreachable — retry on next heartbeat
+		}
+
+		n.mu.Lock()
+		if resp.Term > n.currentTerm {
+			n.becomeFollower(resp.Term)
+			n.mu.Unlock()
+			return
+		}
+		if n.role != RoleLeader || n.currentTerm != term {
+			n.mu.Unlock()
+			return // no longer leader for the term this transfer started in
+		}
+		if !resp.Success {
+			n.mu.Unlock()
+			return // rejected — retry from offset 0 on the next heartbeat
+		}
+		if done {
+			if lastIncludedIndex > n.matchIndex[peerID] {
+				n.matchIndex[peerID] = lastIncludedIndex
+				n.nextIndex[peerID] = lastIncludedIndex + 1
+			}
+			n.mu.Unlock()
+			return
+		}
+		n.mu.Unlock()
+
+		offset = end
+	}
+}
+
 // maybeAdvanceCommit checks whether a new log entry can be committed.
 // An entry is committed once a majority of nodes have it in their log.
 // MUST be called with n.mu held.
@@ -719,7 +940,7 @@ func (n *Node) maybeAdvanceCommit() {
 
 // advanceCommitTo advances commitIndex to newCommit and notifies the application.
 // MUST be called with n.mu held; it is kept held for the entire function,
-// including while sending on CommitCh (see note below).
+// including while sending on ApplyCh (see note below).
 func (n *Node) advanceCommitTo(newCommit uint64) {
 	var toNotify []*LogEntry
 	for i := n.commitIndex + 1; i <= newCommit; i++ {
@@ -732,16 +953,18 @@ func (n *Node) advanceCommitTo(newCommit uint64) {
 	// Send while still holding n.mu. This function can be called concurrently
 	// from different goroutines (e.g. two peers' AppendEntries responses each
 	// advancing commit via maybeAdvanceCommit). If the lock were released
-	// before sending, two such calls could interleave their CommitCh sends
+	// before sending, two such calls could interleave their ApplyCh sends
 	// out of index order; the consumer drops any entry whose index is <= its
 	// own lastApplied, so a lower-index entry arriving after a higher-index
 	// one would be silently lost, not just reordered — this previously caused
-	// a reproducible hang in server tests. CommitCh is generously buffered, so
+	// a reproducible hang in server tests. ApplyCh is generously buffered, so
 	// holding the lock here only blocks other RPC handlers in the pathological
-	// case where the application has fallen far behind.
+	// case where the application has fallen far behind. HandleInstallSnapshot
+	// sends its SnapshotValid message the same way, under the same lock, so
+	// all producers share one total order.
 	for _, entry := range toNotify {
 		select {
-		case n.CommitCh <- CommitNotify{Entry: entry}:
+		case n.ApplyCh <- ApplyMsg{CommandValid: true, Entry: entry}:
 		case <-n.stopCh:
 			return
 		}
