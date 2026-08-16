@@ -40,7 +40,8 @@ If the leader crashes after step 3, a new leader is elected and the entry is sti
 │  │  · Leader election  (randomised timeouts)  │ │
 │  │  · Log replication  (AppendEntries)        │ │
 │  │  · Term-based commit safety                │ │
-│  │                           │ CommitCh       │ │
+│  │  · Log compaction   (InstallSnapshot)      │ │
+│  │                           │ ApplyCh        │ │
 │  └───────────────────────────┼────────────────┘ │
 │                              ▼                  │
 │  ┌────────────────────────────────────────────┐ │
@@ -48,6 +49,7 @@ If the leader crashes after step 3, a new leader is elected and the entry is sti
 │  │  · Single-goroutine apply loop             │ │
 │  │  · Client dedup  (ClientID + SeqNum)       │ │
 │  │  · Wakes blocked client RPCs on commit     │ │
+│  │  · Periodic engine snapshot + compaction   │ │
 │  └────────────────────────────────────────────┘ │
 │                              │                  │
 │                              ▼                  │
@@ -133,7 +135,7 @@ make proto
 
 ```bash
 make build        # runs go mod tidy, then compiles both binaries
-make test         # runs all 28 tests across 4 packages
+make test         # runs all 34 tests across 4 packages
 make              # proto + tidy + test + build in one shot
 ```
 
@@ -206,10 +208,11 @@ The chaos harness starts a 3-node cluster, hammers it with concurrent writes acr
 wal/         (4 tests)
   TestWALWriteAndRead              — 100 entries survive close and reopen
   TestWALTruncate                  — suffix removal leaves correct entries
+  TestWALTruncatePrefix            — prefix removal after compaction; lastIndex stays correct
   TestWALBatchAppend               — 200-entry batch, single fsync
   BenchmarkAppend                  — single-entry throughput (~50k–100k ops/s on SSD)
 
-storage/     (8 tests)
+storage/     (9 tests)
   TestMemtableBasic                — put, get, delete, overwrite
   TestMemtableSortOrder            — snapshot is always sorted
   TestSSTableWriteRead             — write entries, read back including tombstones
@@ -217,24 +220,33 @@ storage/     (8 tests)
   TestEngineBasic                  — end-to-end read and write
   TestEngineRestart                — data survives engine close and reopen
   TestEngineCompaction             — 50k entries, compaction runs, spot checks pass
+  TestEngineSnapshotRoundTrip      — snapshot across memtable+SSTables, load into a fresh engine
   BenchmarkEnginePut/Get           — throughput under realistic load
 
-raft/        (7 tests)
+raft/        (12 tests)
+  TestNodeSeedsFromSnapshotOnStart — Start() seeds commitIndex/log from a saved snapshot
   TestElectionBasic                — exactly one leader elected in a 3-node cluster
   TestElectionFiveNodes            — one leader in a 5-node cluster
   TestReelectionAfterLeaderFailure — new leader's term is strictly higher
   TestLogReplication               — all nodes converge to same log and commitIndex
   TestReplicationWithFollowerFailure — cluster commits with 2 of 3 nodes alive
   TestNoCommitWithMinorityPartition  — isolated leader never advances commitIndex
-  TestCommitNotification           — CommitCh delivers every entry exactly once, in order
+  TestCommitNotification           — ApplyCh delivers every entry exactly once, in order
+  TestCompactLogTruncatesPrefix    — CompactLog persists a snapshot and discards its prefix
+  TestInstallSnapshotRejectsStale  — a snapshot no newer than what's held is a no-op
+  TestInstallSnapshotChunkedTransferApplies — multi-chunk reassembly + correct ApplyMsg delivery
+  TestInstallSnapshotRejectsOffsetMismatch  — a chunk that doesn't pick up where the last left off is rejected
 
-server/      (6 tests)
+server/      (9 tests)
   TestPutAndGet                    — full round-trip: propose → commit → apply → read
   TestDeduplication                — retry with same SeqNum does not re-apply
   TestNonLeaderRejectsWrites       — isolated node returns ErrNotLeader immediately
   TestMultipleWritesOrdered        — 20 writes apply in order; lastApplied == 20
   TestDeleteRemovesKey             — DELETE makes key unreadable via tombstone
   TestCommitNotificationUnblocksPropose — ProposeWrite returns only after commit
+  TestSnapshotTriggersAtInterval   — WithSnapshotInterval compacts the log at the right boundary
+  TestSnapshotSurvivesRestart      — snapshot + restart seeds the fast-path, data intact
+  TestWALStateSnapshotRoundTrip    — walState.SaveSnapshot/LoadSnapshot survive a reopen
 ```
 
 ---
@@ -281,7 +293,6 @@ This is Raft's leader completeness rule (Section 5.4 of the paper) and the most 
 
 ## What's not implemented
 
-- **Snapshots** — `InstallSnapshot` is wired up in the proto and the handler exists, but the state machine doesn't apply incoming snapshots. A lagging follower is recovered via full log replay instead. For long-lived clusters this becomes expensive; the fix is to serialize LSM state + `lastApplied` to a snapshot file periodically.
 - **Membership changes** — The cluster topology is fixed at startup. Dynamic add/remove requires a two-phase joint consensus protocol (Raft Section 6).
 - **TLS** — Peer connections use plaintext gRPC. Production deployments should use mutual TLS between nodes.
 - **Leveled compaction** — The storage engine uses a simple "merge all SSTables" strategy. RocksDB-style leveled compaction would reduce write amplification significantly for large datasets.

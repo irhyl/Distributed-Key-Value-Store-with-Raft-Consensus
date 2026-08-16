@@ -242,23 +242,28 @@ By translating the node ID to an address on the server side (using `cfg.Peers[le
 
 ---
 
-## No snapshots (yet)
+## Log snapshotting
 
-**Decision:** `HandleInstallSnapshot` is a no-op stub. Recovery is always done by full WAL replay.
+**Decision:** the state machine snapshots the LSM engine and compacts the Raft log every `snapshotInterval` applied entries (`server.WithSnapshotInterval`, off by default). A lagging follower whose `nextIndex` falls at or before the leader's compaction point receives the snapshot via chunked `InstallSnapshot` RPCs instead of individual log entries.
 
-**The cost:**
+**The problem this solves:**
 
-Startup time grows linearly with log length. A cluster that has processed 1 million writes must replay all 1 million WAL entries before the node can serve requests. Each entry is a protobuf unmarshal + LSM write — on a fast machine, ~1 million/sec. So 1 million entries takes ~1 second. Acceptable for moderate logs, but it compounds: after 10 million entries, restart takes ~10 seconds.
+Without snapshots, startup time and per-follower catch-up time both grow linearly with total log length — a node that's fallen behind (or is restarting after processing millions of writes) must replay every entry from the beginning. Snapshotting bounds both: a node only ever needs to replay entries after the most recent snapshot, and a follower that's fallen far enough behind gets a single state transfer instead of a long tail of individual `AppendEntries` calls.
 
-**What snapshots would fix:**
+**How it fits together (bottom to top):**
 
-A snapshot is a point-in-time serialisation of the entire LSM state plus the `lastApplied` index. On restart, instead of replaying entries 1 through N, the node loads the snapshot (covering 1 through S) and replays only entries S+1 through N. If snapshots are taken every 100k entries, restart never replays more than 100k entries regardless of total log size.
+- `storage.Engine.Snapshot()`/`LoadSnapshot()` — engine-level, Raft-agnostic. `Snapshot()` merges the active memtable, the immutable memtable (if a flush is mid-flight), and all on-disk SSTables using the same newest-wins/tombstone-dropping rules `Get()` and compaction already use, rather than forcing a flush first and trusting it landed — the latter has a race where a concurrent background flush could leave very recent writes out of the snapshot.
+- `wal.WAL.TruncatePrefix` / `raft.PersistentState.{Save,Load}Snapshot` — durable storage for the snapshot bytes plus the `(lastIncludedIndex, lastIncludedTerm)` it covers, and a way to discard the WAL entries it makes redundant. `walState` packs the index/term into the same file as the snapshot bytes, rather than a separate metadata file, so one atomic temp-file+rename can't leave them pointing at different snapshots after a crash mid-write.
+- `raft.Node` — owns compaction bookkeeping (`lastIncludedIndex`/`lastIncludedTerm`, and `logPos()` to translate a Raft index into the correct position in the now-shorter in-memory log) and the wire protocol (`CompactLog` to record a locally-taken snapshot, `HandleInstallSnapshot` to receive one, `replicateToPeer` switching to chunked sends when a peer's `nextIndex` has fallen behind the compaction point). Node has no opinion on *when* to snapshot — only on how to record that one happened.
+- `server.StateMachine` — decides *when*: every Nth applied entry, synchronously in the same apply-loop goroutine (never concurrently with applying the next entry, which is what keeps a snapshot's contents consistent with the index it's recorded under), and applies snapshots it receives from a leader.
 
-**Why it's not implemented:**
+**Design choices worth calling out:**
 
-Snapshots are the most complex part of Raft. The leader must send snapshots to lagging followers (via `InstallSnapshot`), followers must apply snapshots to their state machines atomically, and both sides must handle chunked transfers for large snapshots. The correctness requirements are subtle enough that the Raft paper devotes a full section to them. Implementing it correctly without tests would be risky.
+- *Discard-entire-log-on-install, not retain-matching-suffix.* The Raft paper (§7) notes a follower receiving `InstallSnapshot` can keep any suffix of its own log that happens to match the leader's, rather than discarding everything. This implementation always discards and starts fresh from the snapshot's sentinel entry — simpler, always correct, at the cost of occasionally re-replicating a few entries the follower already had.
+- *Dedup table reset on snapshot install.* `StateMachine`'s per-client sequence-number map has no representation in the snapshot format, so installing one wipes it. A client whose write was folded into the snapshot could in principle retry after this and be reapplied. Real systems like etcd embed the session table in the snapshot itself to avoid this; left out here to keep the snapshot format simple — documented, not silently accepted.
+- *Interaction with the current-term-commit rule.* A snapshot can only ever cover applied (and therefore committed) entries, so a peer's `matchIndex` jumping to `lastIncludedIndex` after a successful install can never retroactively "commit" anything through `maybeAdvanceCommit` — those indices aren't even addressable in the compacted log anymore. The one thing that had to change was every raw `n.log[idx]` access in the replication/commit path, which now goes through `logPos()` instead — verified as a behavior-preserving refactor on its own, before any snapshot-producing code was added (see `raft/node.go`'s `logPos` doc comment).
 
-The system is correct and complete without snapshots, it just has a startup time proportional to log length. Adding snapshots is a well-defined extension that doesn't require changing any existing code.
+**A gap found while building this:** testing the leader→follower catch-up path surfaced a real, pre-existing liveness issue — this implementation has no PreVote phase, so a disconnected node's election term drifts unboundedly and is disruptive on reconnection. Not a snapshotting bug, and not a safety issue, but real enough to be worth its own section — see "No PreVote" below.
 
 ---
 
