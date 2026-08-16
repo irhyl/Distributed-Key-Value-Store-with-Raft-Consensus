@@ -352,7 +352,9 @@ func (e *Engine) loadSSTables() error {
 	if len(paths) > 0 {
 		// Extract seq from last (highest) path name
 		var seq uint64
-		fmt.Sscanf(filepath.Base(paths[0]), "%d.sst", &seq)
+		if _, err := fmt.Sscanf(filepath.Base(paths[0]), "%d.sst", &seq); err != nil {
+			return fmt.Errorf("storage: parse sstable sequence from %s: %w", paths[0], err)
+		}
 		atomic.StoreUint64(&e.sstableSeq, seq)
 	}
 

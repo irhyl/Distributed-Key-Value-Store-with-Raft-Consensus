@@ -310,8 +310,12 @@ func (w *WAL) createSegment(firstIndex uint64) error {
 
 // rollSegment closes the current segment and starts a new one.
 func (w *WAL) rollSegment(nextIndex uint64) error {
-	w.writer.Flush()
-	w.current.Sync()
+	if err := w.writer.Flush(); err != nil {
+		return fmt.Errorf("wal: flush before roll: %w", err)
+	}
+	if err := w.current.Sync(); err != nil {
+		return fmt.Errorf("wal: sync before roll: %w", err)
+	}
 	return w.createSegment(nextIndex)
 }
 

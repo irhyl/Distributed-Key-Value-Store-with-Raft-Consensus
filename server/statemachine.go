@@ -91,17 +91,25 @@ func (sm *StateMachine) ProposeWrite(cmd Command) error {
 		return fmt.Errorf("marshal command: %w", err)
 	}
 
+	// Hold sm.mu across Propose()+registration below. Propose() can commit
+	// and notify synchronously (e.g. the single-node fast path, where
+	// maybeAdvanceCommit runs inline and the apply loop may run before this
+	// function would otherwise register its waiter) — apply() takes the same
+	// lock before calling notifyPending, so registering under it here closes
+	// the race where a fast commit's notification arrives, finds no pending
+	// waiter yet, and is dropped, leaving this call blocked forever.
+	sm.mu.Lock()
+
 	// Submit to Raft — this appends to the local log and starts replication
 	logIndex, term, isLeader := sm.node.Propose(data)
 	if !isLeader {
+		sm.mu.Unlock()
 		return ErrNotLeader
 	}
 
 	// Register a pending waiter for this log index
 	done := make(chan Result, 1)
 	pw := &pendingWrite{logIndex: logIndex, term: term, done: done}
-
-	sm.mu.Lock()
 	sm.pending[logIndex] = pw
 	sm.mu.Unlock()
 

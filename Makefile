@@ -1,4 +1,4 @@
-.PHONY: all proto build test clean chaos
+.PHONY: all proto build test lint clean chaos
 
 BINARY_SERVER := raftkv-server
 BINARY_CLI    := raftkv-cli
@@ -41,6 +41,10 @@ test-race: deps
 	go test -race ./storage/... -timeout 60s -count=1
 	go test -race ./raft/...    -timeout 60s -count=1
 	go test -race ./server/...  -timeout 60s -count=1
+
+# Run golangci-lint (requires: go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest)
+lint:
+	golangci-lint run ./...
 
 # Run benchmarks across all packages
 bench:

@@ -67,26 +67,39 @@ func (w *SSTableWriter) Write(entries []memEntry) error {
 		if err := binary.Write(buf, binary.LittleEndian, uint32(len(e.key))); err != nil {
 			return err
 		}
-		buf.WriteString(e.key)
+		if _, err := buf.WriteString(e.key); err != nil {
+			return err
+		}
 
 		// value length + value bytes (0 length for tombstones)
 		if err := binary.Write(buf, binary.LittleEndian, uint32(len(e.value))); err != nil {
 			return err
 		}
 		if len(e.value) > 0 {
-			buf.Write(e.value)
+			if _, err := buf.Write(e.value); err != nil {
+				return err
+			}
 		}
 
 		// kind byte (put=0, delete=1)
-		buf.WriteByte(byte(e.kind))
+		if err := buf.WriteByte(byte(e.kind)); err != nil {
+			return err
+		}
 	}
 
 	// Track actual bloom offset by flushing and checking file position
-	buf.Flush()
-	bloomOffset, _ := f.Seek(0, io.SeekCurrent)
+	if err := buf.Flush(); err != nil {
+		return fmt.Errorf("sstable flush data block: %w", err)
+	}
+	bloomOffset, err := f.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return fmt.Errorf("sstable seek: %w", err)
+	}
 
 	// ── Bloom filter block ─────────────────────────────────────────────────
-	f.Write(bloom.bits[:])
+	if _, err := f.Write(bloom.bits[:]); err != nil {
+		return fmt.Errorf("sstable write bloom block: %w", err)
+	}
 
 	// ── Footer ────────────────────────────────────────────────────────────
 	var footer [24]byte
@@ -94,7 +107,9 @@ func (w *SSTableWriter) Write(entries []memEntry) error {
 	binary.LittleEndian.PutUint64(footer[8:16], uint64(bloomSize))
 	binary.LittleEndian.PutUint32(footer[16:20], uint32(len(entries)))
 	binary.LittleEndian.PutUint32(footer[20:24], sstMagic)
-	f.Write(footer[:])
+	if _, err := f.Write(footer[:]); err != nil {
+		return fmt.Errorf("sstable write footer: %w", err)
+	}
 
 	return f.Sync()
 }
@@ -121,7 +136,9 @@ func OpenSSTable(path string) (*SSTableReader, error) {
 		return nil, fmt.Errorf("sstable %s: file too small", path)
 	}
 
-	f.Seek(-24, io.SeekEnd)
+	if _, err := f.Seek(-24, io.SeekEnd); err != nil {
+		return nil, fmt.Errorf("sstable %s: seek footer: %w", path, err)
+	}
 	var footer [24]byte
 	if _, err := io.ReadFull(f, footer[:]); err != nil {
 		return nil, err
@@ -137,8 +154,12 @@ func OpenSSTable(path string) (*SSTableReader, error) {
 
 	// Load bloom filter
 	bloom := &bloomFilter{}
-	f.Seek(int64(bloomOffset), io.SeekStart)
-	io.ReadFull(f, bloom.bits[:])
+	if _, err := f.Seek(int64(bloomOffset), io.SeekStart); err != nil {
+		return nil, fmt.Errorf("sstable %s: seek bloom block: %w", path, err)
+	}
+	if _, err := io.ReadFull(f, bloom.bits[:]); err != nil {
+		return nil, fmt.Errorf("sstable %s: read bloom block: %w", path, err)
+	}
 
 	return &SSTableReader{
 		path:       path,
@@ -184,10 +205,14 @@ func (r *SSTableReader) Get(key string) ([]byte, entryKind, bool) {
 
 		// Read value
 		var valLen uint32
-		binary.Read(reader, binary.LittleEndian, &valLen)
+		if err := binary.Read(reader, binary.LittleEndian, &valLen); err != nil {
+			break // EOF or bloom false positive
+		}
 		valBytes := make([]byte, valLen)
 		if valLen > 0 {
-			io.ReadFull(reader, valBytes)
+			if _, err := io.ReadFull(reader, valBytes); err != nil {
+				break
+			}
 		}
 
 		// Read kind
@@ -220,12 +245,18 @@ func (r *SSTableReader) IterateAll() ([]memEntry, error) {
 	defer f.Close()
 
 	// Read footer to find where data block ends (at bloom offset)
-	f.Seek(-24, io.SeekEnd)
+	if _, err := f.Seek(-24, io.SeekEnd); err != nil {
+		return nil, fmt.Errorf("sstable %s: seek footer: %w", r.path, err)
+	}
 	var footer [24]byte
-	io.ReadFull(f, footer[:])
+	if _, err := io.ReadFull(f, footer[:]); err != nil {
+		return nil, fmt.Errorf("sstable %s: read footer: %w", r.path, err)
+	}
 	bloomOffset := binary.LittleEndian.Uint64(footer[0:8])
 
-	f.Seek(0, io.SeekStart)
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("sstable %s: seek start: %w", r.path, err)
+	}
 	reader := bufio.NewReader(f)
 	var entries []memEntry
 	var pos int64
@@ -238,20 +269,29 @@ func (r *SSTableReader) IterateAll() ([]memEntry, error) {
 		pos += 4
 
 		keyBytes := make([]byte, keyLen)
-		io.ReadFull(reader, keyBytes)
+		if _, err := io.ReadFull(reader, keyBytes); err != nil {
+			break
+		}
 		pos += int64(keyLen)
 
 		var valLen uint32
-		binary.Read(reader, binary.LittleEndian, &valLen)
+		if err := binary.Read(reader, binary.LittleEndian, &valLen); err != nil {
+			break
+		}
 		pos += 4
 
 		valBytes := make([]byte, valLen)
 		if valLen > 0 {
-			io.ReadFull(reader, valBytes)
+			if _, err := io.ReadFull(reader, valBytes); err != nil {
+				break
+			}
 			pos += int64(valLen)
 		}
 
-		kindByte, _ := reader.ReadByte()
+		kindByte, err := reader.ReadByte()
+		if err != nil {
+			break
+		}
 		pos += 1
 
 		entries = append(entries, memEntry{
