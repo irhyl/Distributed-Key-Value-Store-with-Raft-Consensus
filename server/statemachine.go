@@ -57,18 +57,39 @@ type StateMachine struct {
 	// Requests with seqNum <= lastSeq[clientID] are silently skipped.
 	lastSeq map[string]uint64
 
+	// snapshotInterval: after every Nth applied entry, snapshot the engine
+	// and compact the Raft log. 0 disables automatic snapshotting.
+	snapshotInterval uint64
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
 
+// Option configures a StateMachine at construction time.
+type Option func(*StateMachine)
+
+// WithSnapshotInterval makes the state machine snapshot the engine and
+// compact the Raft log every interval applied entries. Applied before the
+// apply loop goroutine starts, so setting it here — rather than mutating
+// the field after construction — avoids a data race with that goroutine
+// reading it.
+func WithSnapshotInterval(interval uint64) Option {
+	return func(sm *StateMachine) {
+		sm.snapshotInterval = interval
+	}
+}
+
 // NewStateMachine creates a state machine backed by engine, consuming from node.ApplyCh.
-func NewStateMachine(node *raft.Node, engine *storage.Engine) *StateMachine {
+func NewStateMachine(node *raft.Node, engine *storage.Engine, opts ...Option) *StateMachine {
 	sm := &StateMachine{
 		engine:  engine,
 		node:    node,
 		pending: make(map[uint64]*pendingWrite),
 		lastSeq: make(map[string]uint64),
 		stopCh:  make(chan struct{}),
+	}
+	for _, opt := range opts {
+		opt(sm)
 	}
 	sm.wg.Add(1)
 	go sm.applyLoop()
@@ -178,13 +199,83 @@ func (sm *StateMachine) dispatch(msg raft.ApplyMsg) {
 	switch {
 	case msg.CommandValid:
 		sm.apply(msg.Entry)
+		// Triggered here, after apply() has released sm.mu, rather than
+		// from inside apply() itself: snapshotting takes real engine I/O,
+		// and there's no reason to hold sm.mu (blocking ProposeWrite
+		// registration and LastApplied reads) for that. Still runs on this
+		// same single apply-loop goroutine, though — never concurrently
+		// with apply() of the next entry, which is what keeps a snapshot's
+		// contents and its recorded index consistent with each other.
+		if sm.snapshotInterval > 0 && msg.Entry.Index%sm.snapshotInterval == 0 {
+			sm.maybeSnapshot(msg.Entry.Index, msg.Entry.Term)
+		}
 	case msg.SnapshotValid:
-		// TODO(snapshotting): install msg.Snapshot into the storage engine
-		// and reset dedup/pending state. Not yet wired up — a peer that
-		// falls behind and receives InstallSnapshot from the leader will
-		// have this message dropped here rather than actually catching up.
-		log.Printf("[statemachine] received snapshot up to index %d (not yet applied)", msg.SnapshotIndex)
+		sm.applySnapshot(msg)
 	}
+}
+
+// maybeSnapshot snapshots the engine's current state and asks Raft to
+// compact its log up to index. Errors are logged, not fatal: a failed
+// snapshot attempt just means the log stays uncompacted a bit longer and
+// gets retried at the next interval boundary — restart still falls back to
+// full WAL replay, which is slower but correct.
+func (sm *StateMachine) maybeSnapshot(index, term uint64) {
+	data, err := sm.engine.Snapshot()
+	if err != nil {
+		log.Printf("[statemachine] ERROR: create snapshot at index %d: %v", index, err)
+		return
+	}
+	if err := sm.node.CompactLog(data, index, term); err != nil {
+		log.Printf("[statemachine] ERROR: compact log at index %d: %v", index, err)
+	}
+}
+
+// applySnapshot installs a snapshot received via Raft's InstallSnapshot
+// (i.e. this node was far enough behind that the leader sent its full
+// state rather than individual log entries).
+func (sm *StateMachine) applySnapshot(msg raft.ApplyMsg) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Staleness guard, mirroring apply()'s: don't regress if we've already
+	// applied past what this snapshot covers (e.g. a delayed delivery that
+	// arrived after we'd already caught up some other way).
+	if msg.SnapshotIndex <= sm.lastApplied {
+		log.Printf("[statemachine] skipping stale snapshot at index %d (already applied through %d)",
+			msg.SnapshotIndex, sm.lastApplied)
+		return
+	}
+
+	if err := sm.engine.LoadSnapshot(msg.Snapshot); err != nil {
+		log.Printf("[statemachine] ERROR: load installed snapshot at index %d: %v", msg.SnapshotIndex, err)
+		return
+	}
+
+	// The snapshot folds in an unknown mix of clients' writes with no
+	// per-client sequence-number record of its own, so the dedup table has
+	// to be reset wholesale. Documented limitation: a client whose write
+	// was folded into the snapshot could in principle retry after this and
+	// be reapplied. Real systems like etcd embed the session table in the
+	// snapshot itself to avoid that; left out here to keep the snapshot
+	// format simple.
+	sm.lastSeq = make(map[string]uint64)
+
+	// Any pending write at or below the new baseline will never be
+	// individually delivered again — its entry, if it ever existed on this
+	// node, is now folded into the snapshot with no per-entry outcome to
+	// report. Resolve it now so the waiting client goroutine doesn't leak
+	// forever waiting on a notification that will never come.
+	for idx, pw := range sm.pending {
+		if idx <= msg.SnapshotIndex {
+			delete(sm.pending, idx)
+			select {
+			case pw.done <- Result{Err: "entry superseded by an installed snapshot"}:
+			default:
+			}
+		}
+	}
+
+	sm.lastApplied = msg.SnapshotIndex
 }
 
 // apply executes a single committed log entry against the storage engine.

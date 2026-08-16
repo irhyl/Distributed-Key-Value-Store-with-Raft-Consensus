@@ -303,6 +303,14 @@ func (n *Node) GetState() (uint64, bool) {
 	return n.currentTerm, n.role == RoleLeader
 }
 
+// SnapshotIndex returns the index of the most recent snapshot this node has
+// taken or installed (lastIncludedIndex), or 0 if it has never snapshotted.
+func (n *Node) SnapshotIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lastIncludedIndex
+}
+
 // ── Main event loop ────────────────────────────────────────────────────────────
 
 // run is the main goroutine. It processes timer events only;

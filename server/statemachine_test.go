@@ -14,13 +14,23 @@ import (
 // The node becomes leader automatically (quorum = 1 with no peers).
 func makeTestSM(t *testing.T) (*StateMachine, func()) {
 	t.Helper()
+	sm, _, _, cleanup := makeTestSMWithOpts(t)
+	return sm, cleanup
+}
+
+// makeTestSMWithOpts is makeTestSM but also returns the underlying engine
+// and data directory (needed by tests that inspect engine state directly or
+// reopen the same directory to test restart behavior), and forwards opts to
+// NewStateMachine (needed by tests exercising WithSnapshotInterval).
+func makeTestSMWithOpts(t *testing.T, opts ...Option) (sm *StateMachine, eng *storage.Engine, dir string, cleanup func()) {
+	t.Helper()
 
 	dir, err := os.MkdirTemp("", "server-test-*")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	eng, err := storage.Open(dir + "/storage")
+	eng, err = storage.Open(dir + "/storage")
 	if err != nil {
 		os.RemoveAll(dir)
 		t.Fatal(err)
@@ -53,15 +63,15 @@ func makeTestSM(t *testing.T) (*StateMachine, func()) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	sm := NewStateMachine(node, eng)
+	sm = NewStateMachine(node, eng, opts...)
 
-	cleanup := func() {
+	cleanup = func() {
 		sm.Stop()
 		node.Stop()
 		eng.Close()
 		os.RemoveAll(dir)
 	}
-	return sm, cleanup
+	return sm, eng, dir, cleanup
 }
 
 func cmd(op, key string, val []byte, clientID string, seq uint64) Command {
@@ -218,5 +228,101 @@ func TestCommitNotificationUnblocksPropose(t *testing.T) {
 	val, found, _ := sm.ReadValue("sync")
 	if !found || string(val) != "yes" {
 		t.Fatalf("value not visible after propose returned: found=%v val=%q", found, val)
+	}
+}
+
+// TestSnapshotTriggersAtInterval verifies that WithSnapshotInterval causes
+// the state machine to compact the Raft log automatically as entries are
+// applied, at multiples of the configured interval.
+func TestSnapshotTriggersAtInterval(t *testing.T) {
+	sm, _, _, cleanup := makeTestSMWithOpts(t, WithSnapshotInterval(5))
+	defer cleanup()
+
+	for i := 1; i <= 12; i++ {
+		key := fmt.Sprintf("key%02d", i)
+		if err := sm.ProposeWrite(cmd("put", key, []byte("v"), "c1", uint64(i))); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+
+	// maybeSnapshot runs synchronously in the apply loop right after each
+	// entry that lands on an interval boundary, so by the time
+	// ProposeWrite(12) has returned, the snapshot at index 10 (the highest
+	// multiple of 5 <= 12) should already be recorded.
+	if got := sm.node.SnapshotIndex(); got != 10 {
+		t.Fatalf("SnapshotIndex: got %d, want 10", got)
+	}
+}
+
+// TestSnapshotSurvivesRestart verifies that a snapshot taken before a
+// restart is picked up on reopen — proving the restart fast-path (seeding
+// commitIndex from the snapshot instead of always starting at 0) actually
+// engages, and that data survives the compaction + restart combination.
+func TestSnapshotSurvivesRestart(t *testing.T) {
+	// cleanup is intentionally unused: this test manually stops/closes the
+	// first sm/node/eng partway through to reopen the same directory, so
+	// the normal cleanup closure (which would double-Stop them) doesn't apply.
+	sm, eng, dir, _ := makeTestSMWithOpts(t, WithSnapshotInterval(5))
+
+	for i := 1; i <= 8; i++ {
+		key := fmt.Sprintf("key%02d", i)
+		val := fmt.Sprintf("val%02d", i)
+		if err := sm.ProposeWrite(cmd("put", key, []byte(val), "c1", uint64(i))); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	if got := sm.node.SnapshotIndex(); got != 5 {
+		t.Fatalf("before restart: SnapshotIndex got %d, want 5", got)
+	}
+
+	sm.Stop()
+	sm.node.Stop()
+	eng.Close()
+
+	// Reopen against the same directory — mirrors kvserver.go's startup
+	// sequence, not calling makeTestSMWithOpts again (which would create a
+	// fresh temp dir).
+	eng2, err := storage.Open(dir + "/storage")
+	if err != nil {
+		os.RemoveAll(dir)
+		t.Fatalf("reopen engine: %v", err)
+	}
+	ws2, err := newWALState(dir + "/wal")
+	if err != nil {
+		eng2.Close()
+		os.RemoveAll(dir)
+		t.Fatalf("reopen wal state: %v", err)
+	}
+	net2 := raft.NewNetwork()
+	cfg := raft.Config{ID: "node1", Peers: map[string]string{}}
+	node2 := raft.NewNode(cfg, net2.TransportFor("node1"), ws2)
+	net2.Add("node1", node2)
+	if err := node2.Start(); err != nil {
+		eng2.Close()
+		os.RemoveAll(dir)
+		t.Fatalf("restart node: %v", err)
+	}
+	defer func() {
+		node2.Stop()
+		eng2.Close()
+		os.RemoveAll(dir)
+	}()
+
+	// The snapshot metadata must have been loaded on Start(), proving the
+	// fast-path engaged rather than starting fresh at lastIncludedIndex=0.
+	if got := node2.SnapshotIndex(); got != 5 {
+		t.Fatalf("after restart: SnapshotIndex got %d, want 5 (fast-path did not engage)", got)
+	}
+
+	// All 8 original writes must still be readable — 1-5 via the snapshot
+	// (engine.Open already replayed its own SSTables independent of Raft),
+	// 6-8 via normal WAL replay of the entries after the snapshot boundary.
+	for i := 1; i <= 8; i++ {
+		key := fmt.Sprintf("key%02d", i)
+		want := fmt.Sprintf("val%02d", i)
+		val, found := eng2.Get(key)
+		if !found || string(val) != want {
+			t.Fatalf("after restart: get %s = %q %v, want %q", key, val, found, want)
+		}
 	}
 }
