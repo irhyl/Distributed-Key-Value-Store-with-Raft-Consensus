@@ -1003,6 +1003,133 @@ func (x *DeleteResponse) GetLeaderHint() string {
 	return ""
 }
 
+// ─────────────────────────────────────────────
+//
+//	KV Service: Watch (change data capture)
+//	Streams every committed write as it's applied to this node's state
+//	machine, in commit order. The first streaming RPC in this codebase.
+//
+// ─────────────────────────────────────────────
+type WatchRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	KeyPrefix     string                 `protobuf:"bytes,1,opt,name=key_prefix,json=keyPrefix,proto3" json:"key_prefix,omitempty"` // only stream keys with this prefix; empty = all keys
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WatchRequest) Reset() {
+	*x = WatchRequest{}
+	mi := &file_proto_raftkv_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WatchRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WatchRequest) ProtoMessage() {}
+
+func (x *WatchRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raftkv_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WatchRequest.ProtoReflect.Descriptor instead.
+func (*WatchRequest) Descriptor() ([]byte, []int) {
+	return file_proto_raftkv_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *WatchRequest) GetKeyPrefix() string {
+	if x != nil {
+		return x.KeyPrefix
+	}
+	return ""
+}
+
+type ChangeEvent struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Index         uint64                 `protobuf:"varint,1,opt,name=index,proto3" json:"index,omitempty"` // Raft log index this write committed at
+	Term          uint64                 `protobuf:"varint,2,opt,name=term,proto3" json:"term,omitempty"`   // Raft term the entry was created in
+	Op            OpType                 `protobuf:"varint,3,opt,name=op,proto3,enum=raftkv.OpType" json:"op,omitempty"`
+	Key           string                 `protobuf:"bytes,4,opt,name=key,proto3" json:"key,omitempty"`
+	Value         []byte                 `protobuf:"bytes,5,opt,name=value,proto3" json:"value,omitempty"` // empty for OP_DELETE
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ChangeEvent) Reset() {
+	*x = ChangeEvent{}
+	mi := &file_proto_raftkv_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ChangeEvent) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ChangeEvent) ProtoMessage() {}
+
+func (x *ChangeEvent) ProtoReflect() protoreflect.Message {
+	mi := &file_proto_raftkv_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ChangeEvent.ProtoReflect.Descriptor instead.
+func (*ChangeEvent) Descriptor() ([]byte, []int) {
+	return file_proto_raftkv_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *ChangeEvent) GetIndex() uint64 {
+	if x != nil {
+		return x.Index
+	}
+	return 0
+}
+
+func (x *ChangeEvent) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *ChangeEvent) GetOp() OpType {
+	if x != nil {
+		return x.Op
+	}
+	return OpType_OP_PUT
+}
+
+func (x *ChangeEvent) GetKey() string {
+	if x != nil {
+		return x.Key
+	}
+	return ""
+}
+
+func (x *ChangeEvent) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
 var File_proto_raftkv_proto protoreflect.FileDescriptor
 
 const file_proto_raftkv_proto_rawDesc = "" +
@@ -1072,7 +1199,16 @@ const file_proto_raftkv_proto_rawDesc = "" +
 	"\x0eDeleteResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x1f\n" +
 	"\vleader_hint\x18\x02 \x01(\tR\n" +
-	"leaderHint*/\n" +
+	"leaderHint\"-\n" +
+	"\fWatchRequest\x12\x1d\n" +
+	"\n" +
+	"key_prefix\x18\x01 \x01(\tR\tkeyPrefix\"\x7f\n" +
+	"\vChangeEvent\x12\x14\n" +
+	"\x05index\x18\x01 \x01(\x04R\x05index\x12\x12\n" +
+	"\x04term\x18\x02 \x01(\x04R\x04term\x12\x1e\n" +
+	"\x02op\x18\x03 \x01(\x0e2\x0e.raftkv.OpTypeR\x02op\x12\x10\n" +
+	"\x03key\x18\x04 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x05 \x01(\fR\x05value*/\n" +
 	"\tEntryType\x12\x10\n" +
 	"\fENTRY_NORMAL\x10\x00\x12\x10\n" +
 	"\fENTRY_CONFIG\x10\x01*#\n" +
@@ -1083,11 +1219,12 @@ const file_proto_raftkv_proto_rawDesc = "" +
 	"\vRaftService\x12F\n" +
 	"\vRequestVote\x12\x1a.raftkv.RequestVoteRequest\x1a\x1b.raftkv.RequestVoteResponse\x12L\n" +
 	"\rAppendEntries\x12\x1c.raftkv.AppendEntriesRequest\x1a\x1d.raftkv.AppendEntriesResponse\x12R\n" +
-	"\x0fInstallSnapshot\x12\x1e.raftkv.InstallSnapshotRequest\x1a\x1f.raftkv.InstallSnapshotResponse2\xa4\x01\n" +
+	"\x0fInstallSnapshot\x12\x1e.raftkv.InstallSnapshotRequest\x1a\x1f.raftkv.InstallSnapshotResponse2\xda\x01\n" +
 	"\tKVService\x12.\n" +
 	"\x03Get\x12\x12.raftkv.GetRequest\x1a\x13.raftkv.GetResponse\x12.\n" +
 	"\x03Put\x12\x12.raftkv.PutRequest\x1a\x13.raftkv.PutResponse\x127\n" +
-	"\x06Delete\x12\x15.raftkv.DeleteRequest\x1a\x16.raftkv.DeleteResponseB\x19Z\x17github.com/raftkv/protob\x06proto3"
+	"\x06Delete\x12\x15.raftkv.DeleteRequest\x1a\x16.raftkv.DeleteResponse\x124\n" +
+	"\x05Watch\x12\x14.raftkv.WatchRequest\x1a\x13.raftkv.ChangeEvent0\x01B\x19Z\x17github.com/raftkv/protob\x06proto3"
 
 var (
 	file_proto_raftkv_proto_rawDescOnce sync.Once
@@ -1102,7 +1239,7 @@ func file_proto_raftkv_proto_rawDescGZIP() []byte {
 }
 
 var file_proto_raftkv_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_proto_raftkv_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
+var file_proto_raftkv_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
 var file_proto_raftkv_proto_goTypes = []any{
 	(EntryType)(0),                  // 0: raftkv.EntryType
 	(OpType)(0),                     // 1: raftkv.OpType
@@ -1120,28 +1257,33 @@ var file_proto_raftkv_proto_goTypes = []any{
 	(*PutResponse)(nil),             // 13: raftkv.PutResponse
 	(*DeleteRequest)(nil),           // 14: raftkv.DeleteRequest
 	(*DeleteResponse)(nil),          // 15: raftkv.DeleteResponse
+	(*WatchRequest)(nil),            // 16: raftkv.WatchRequest
+	(*ChangeEvent)(nil),             // 17: raftkv.ChangeEvent
 }
 var file_proto_raftkv_proto_depIdxs = []int32{
 	0,  // 0: raftkv.LogEntry.type:type_name -> raftkv.EntryType
 	1,  // 1: raftkv.KVCommand.op:type_name -> raftkv.OpType
 	2,  // 2: raftkv.AppendEntriesRequest.entries:type_name -> raftkv.LogEntry
-	4,  // 3: raftkv.RaftService.RequestVote:input_type -> raftkv.RequestVoteRequest
-	6,  // 4: raftkv.RaftService.AppendEntries:input_type -> raftkv.AppendEntriesRequest
-	8,  // 5: raftkv.RaftService.InstallSnapshot:input_type -> raftkv.InstallSnapshotRequest
-	10, // 6: raftkv.KVService.Get:input_type -> raftkv.GetRequest
-	12, // 7: raftkv.KVService.Put:input_type -> raftkv.PutRequest
-	14, // 8: raftkv.KVService.Delete:input_type -> raftkv.DeleteRequest
-	5,  // 9: raftkv.RaftService.RequestVote:output_type -> raftkv.RequestVoteResponse
-	7,  // 10: raftkv.RaftService.AppendEntries:output_type -> raftkv.AppendEntriesResponse
-	9,  // 11: raftkv.RaftService.InstallSnapshot:output_type -> raftkv.InstallSnapshotResponse
-	11, // 12: raftkv.KVService.Get:output_type -> raftkv.GetResponse
-	13, // 13: raftkv.KVService.Put:output_type -> raftkv.PutResponse
-	15, // 14: raftkv.KVService.Delete:output_type -> raftkv.DeleteResponse
-	9,  // [9:15] is the sub-list for method output_type
-	3,  // [3:9] is the sub-list for method input_type
-	3,  // [3:3] is the sub-list for extension type_name
-	3,  // [3:3] is the sub-list for extension extendee
-	0,  // [0:3] is the sub-list for field type_name
+	1,  // 3: raftkv.ChangeEvent.op:type_name -> raftkv.OpType
+	4,  // 4: raftkv.RaftService.RequestVote:input_type -> raftkv.RequestVoteRequest
+	6,  // 5: raftkv.RaftService.AppendEntries:input_type -> raftkv.AppendEntriesRequest
+	8,  // 6: raftkv.RaftService.InstallSnapshot:input_type -> raftkv.InstallSnapshotRequest
+	10, // 7: raftkv.KVService.Get:input_type -> raftkv.GetRequest
+	12, // 8: raftkv.KVService.Put:input_type -> raftkv.PutRequest
+	14, // 9: raftkv.KVService.Delete:input_type -> raftkv.DeleteRequest
+	16, // 10: raftkv.KVService.Watch:input_type -> raftkv.WatchRequest
+	5,  // 11: raftkv.RaftService.RequestVote:output_type -> raftkv.RequestVoteResponse
+	7,  // 12: raftkv.RaftService.AppendEntries:output_type -> raftkv.AppendEntriesResponse
+	9,  // 13: raftkv.RaftService.InstallSnapshot:output_type -> raftkv.InstallSnapshotResponse
+	11, // 14: raftkv.KVService.Get:output_type -> raftkv.GetResponse
+	13, // 15: raftkv.KVService.Put:output_type -> raftkv.PutResponse
+	15, // 16: raftkv.KVService.Delete:output_type -> raftkv.DeleteResponse
+	17, // 17: raftkv.KVService.Watch:output_type -> raftkv.ChangeEvent
+	11, // [11:18] is the sub-list for method output_type
+	4,  // [4:11] is the sub-list for method input_type
+	4,  // [4:4] is the sub-list for extension type_name
+	4,  // [4:4] is the sub-list for extension extendee
+	0,  // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_proto_raftkv_proto_init() }
@@ -1155,7 +1297,7 @@ func file_proto_raftkv_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_proto_raftkv_proto_rawDesc), len(file_proto_raftkv_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   14,
+			NumMessages:   16,
 			NumExtensions: 0,
 			NumServices:   2,
 		},

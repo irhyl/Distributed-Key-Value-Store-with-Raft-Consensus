@@ -114,6 +114,23 @@ message DeleteResponse {
 }
 
 // ─────────────────────────────────────────────
+//  KV Service: Watch (change data capture)
+//  Streams every committed write as it's applied to this node's state
+//  machine, in commit order. The first streaming RPC in this codebase.
+// ─────────────────────────────────────────────
+message WatchRequest {
+  string key_prefix = 1; // only stream keys with this prefix; empty = all keys
+}
+
+message ChangeEvent {
+  uint64 index = 1; // Raft log index this write committed at
+  uint64 term  = 2; // Raft term the entry was created in
+  OpType op    = 3;
+  string key   = 4;
+  bytes  value = 5; // empty for OP_DELETE
+}
+
+// ─────────────────────────────────────────────
 //  Service definitions
 // ─────────────────────────────────────────────
 
@@ -129,4 +146,5 @@ service KVService {
   rpc Get    (GetRequest)    returns (GetResponse);
   rpc Put    (PutRequest)    returns (PutResponse);
   rpc Delete (DeleteRequest) returns (DeleteResponse);
+  rpc Watch  (WatchRequest)  returns (stream ChangeEvent); // change data capture
 }

@@ -201,3 +201,27 @@ func (s *KVServer) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteR
 	}
 	return &pb.DeleteResponse{Success: true}, nil
 }
+
+// Watch streams every write applied on this node from the point of
+// subscription onward — change data capture. Unlike Get/Put/Delete, this
+// works on any node (not leader-only): a follower's applied stream lags the
+// leader's by at most one replication round trip, which is an acceptable
+// tradeoff for a change feed and means Watch doesn't need leader redirection.
+func (s *KVServer) Watch(req *pb.WatchRequest, stream pb.KVService_WatchServer) error {
+	events, unsubscribe := s.sm.Subscribe(req.KeyPrefix)
+	defer unsubscribe()
+
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return fmt.Errorf("watch: subscriber fell too far behind and was disconnected")
+			}
+			if err := stream.Send(event); err != nil {
+				return err
+			}
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
+	}
+}

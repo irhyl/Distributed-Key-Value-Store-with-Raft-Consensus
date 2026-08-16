@@ -90,9 +90,11 @@ Two separate gRPC services on the same port: `RaftService` (peer-to-peer consens
 | `raft/` | `memstate.go` | In-memory `PersistentState` for unit tests |
 | `raft/` | `memtransport.go` | In-memory `Transport` with controllable partitions for tests |
 | `server/` | `kvserver.go` | gRPC server wiring Raft + storage together |
-| `server/` | `statemachine.go` | Apply loop, deduplication, pending write tracking |
+| `server/` | `statemachine.go` | Apply loop, deduplication, pending write tracking, snapshot trigger |
 | `server/` | `walstate.go` | Bridges `raft.PersistentState` → WAL |
 | `server/` | `transport.go` | gRPC implementation of `raft.Transport` |
+| `server/` | `metrics.go` | Prometheus counters/histograms/gauges, `/metrics` HTTP endpoint |
+| `server/` | `watch.go` | Change-data-capture fan-out broadcaster for the `Watch` RPC |
 | `client/` | `main.go` | CLI: get/put/delete with transparent leader redirection |
 | `chaos/` | `chaos.py` | Concurrent writes + random kills + consistency verification |
 
@@ -135,7 +137,7 @@ make proto
 
 ```bash
 make build        # runs go mod tidy, then compiles both binaries
-make test         # runs all 34 tests across 4 packages
+make test         # runs all 37 tests across 4 packages
 make              # proto + tidy + test + build in one shot
 ```
 
@@ -237,7 +239,7 @@ raft/        (12 tests)
   TestInstallSnapshotChunkedTransferApplies — multi-chunk reassembly + correct ApplyMsg delivery
   TestInstallSnapshotRejectsOffsetMismatch  — a chunk that doesn't pick up where the last left off is rejected
 
-server/      (9 tests)
+server/      (12 tests)
   TestPutAndGet                    — full round-trip: propose → commit → apply → read
   TestDeduplication                — retry with same SeqNum does not re-apply
   TestNonLeaderRejectsWrites       — isolated node returns ErrNotLeader immediately
@@ -247,6 +249,9 @@ server/      (9 tests)
   TestSnapshotTriggersAtInterval   — WithSnapshotInterval compacts the log at the right boundary
   TestSnapshotSurvivesRestart      — snapshot + restart seeds the fast-path, data intact
   TestWALStateSnapshotRoundTrip    — walState.SaveSnapshot/LoadSnapshot survive a reopen
+  TestWatchStreamsAppliedWrites    — CDC subscriber sees every write, in commit order
+  TestWatchFiltersByKeyPrefix      — key_prefix excludes non-matching keys
+  TestWatchDropsSlowSubscriber     — a subscriber that never drains is disconnected, not buffered forever
 ```
 
 ---
@@ -277,6 +282,30 @@ Pass `--metrics-listen=<addr>` to expose Prometheus metrics at `http://<addr>/me
 | `raftkv_compaction_duration_seconds` | histogram | LSM compaction run duration |
 
 `raft`, `wal`, and `storage` stay free of any dependency on Prometheus specifically — each exposes a plain optional callback hook (`Node.OnBecomeLeader`, `WAL.OnFsync`, `Engine.OnCompaction`), and `server/metrics.go` is the only file that imports a metrics library, wiring those hooks to Prometheus counters. Swapping backends later only touches that one file.
+
+---
+
+## Change data capture
+
+`KVService.Watch` streams every write applied on a node, in commit order, as it happens — the first streaming RPC in this codebase:
+
+```proto
+rpc Watch(WatchRequest) returns (stream ChangeEvent);
+```
+
+```go
+stream, _ := client.Watch(ctx, &pb.WatchRequest{KeyPrefix: "user:"}) // "" = all keys
+for {
+    event, err := stream.Recv()
+    // event.Index, event.Term, event.Op (PUT/DELETE), event.Key, event.Value
+}
+```
+
+A few things worth knowing:
+
+- **Works on any node, not just the leader.** A follower's applied stream lags the leader's by at most one replication round trip — an acceptable tradeoff for a change feed, and it means `Watch` doesn't need leader redirection the way `Get`/`Put`/`Delete` do.
+- **Slow consumers get disconnected, not buffered forever.** Each subscriber has a bounded channel (256 events); if a client can't keep up, it's dropped and its stream ends with an error rather than blocking the apply loop — and therefore every write in the cluster — waiting for it.
+- **At-least-once, not exactly-once.** There's no resume-from-index yet: a client that disconnects and reconnects starts receiving new events from that point, with a gap for whatever it missed. Combined with the CLI's existing dedup fields, a real CDC consumer (e.g. feeding a search index or a downstream cache) would want to track the last `event.Index` it processed and reconcile via `Get` on reconnect.
 
 ---
 

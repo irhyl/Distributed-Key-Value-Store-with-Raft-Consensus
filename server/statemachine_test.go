@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/raftkv/proto"
 	"github.com/raftkv/raft"
 	"github.com/raftkv/storage"
 )
@@ -323,6 +324,118 @@ func TestSnapshotSurvivesRestart(t *testing.T) {
 		val, found := eng2.Get(key)
 		if !found || string(val) != want {
 			t.Fatalf("after restart: get %s = %q %v, want %q", key, val, found, want)
+		}
+	}
+}
+
+// TestWatchStreamsAppliedWrites verifies that a Subscribe()d change-data-
+// capture consumer receives every applied write, in commit order, with the
+// right op/key/value.
+func TestWatchStreamsAppliedWrites(t *testing.T) {
+	sm, cleanup := makeTestSM(t)
+	defer cleanup()
+
+	events, unsubscribe := sm.Subscribe("")
+	defer unsubscribe()
+
+	if err := sm.ProposeWrite(cmd("put", "a", []byte("1"), "c1", 1)); err != nil {
+		t.Fatalf("put a: %v", err)
+	}
+	if err := sm.ProposeWrite(cmd("put", "b", []byte("2"), "c1", 2)); err != nil {
+		t.Fatalf("put b: %v", err)
+	}
+	if err := sm.ProposeWrite(cmd("delete", "a", nil, "c1", 3)); err != nil {
+		t.Fatalf("delete a: %v", err)
+	}
+
+	want := []struct {
+		op  pb.OpType
+		key string
+		val string
+	}{
+		{pb.OpType_OP_PUT, "a", "1"},
+		{pb.OpType_OP_PUT, "b", "2"},
+		{pb.OpType_OP_DELETE, "a", ""},
+	}
+
+	for i, w := range want {
+		select {
+		case event := <-events:
+			if event.Op != w.op || event.Key != w.key || string(event.Value) != w.val {
+				t.Fatalf("event %d: got op=%v key=%q val=%q, want op=%v key=%q val=%q",
+					i, event.Op, event.Key, event.Value, w.op, w.key, w.val)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("event %d: timeout waiting for change event", i)
+		}
+	}
+}
+
+// TestWatchFiltersByKeyPrefix verifies that a Watch subscriber with a
+// key_prefix only receives events for matching keys.
+func TestWatchFiltersByKeyPrefix(t *testing.T) {
+	sm, cleanup := makeTestSM(t)
+	defer cleanup()
+
+	events, unsubscribe := sm.Subscribe("user:")
+	defer unsubscribe()
+
+	if err := sm.ProposeWrite(cmd("put", "user:1", []byte("alice"), "c1", 1)); err != nil {
+		t.Fatalf("put user:1: %v", err)
+	}
+	if err := sm.ProposeWrite(cmd("put", "order:1", []byte("widget"), "c1", 2)); err != nil {
+		t.Fatalf("put order:1: %v", err)
+	}
+	if err := sm.ProposeWrite(cmd("put", "user:2", []byte("bob"), "c1", 3)); err != nil {
+		t.Fatalf("put user:2: %v", err)
+	}
+
+	for _, wantKey := range []string{"user:1", "user:2"} {
+		select {
+		case event := <-events:
+			if event.Key != wantKey {
+				t.Fatalf("got key %q, want %q", event.Key, wantKey)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timeout waiting for %q", wantKey)
+		}
+	}
+
+	select {
+	case event := <-events:
+		t.Fatalf("unexpected event for non-matching prefix: %+v", event)
+	case <-time.After(200 * time.Millisecond):
+		// Correctly filtered out — order:1 never arrives.
+	}
+}
+
+// TestWatchDropsSlowSubscriber verifies that a subscriber which never
+// drains its channel is disconnected once it exceeds its buffer, rather
+// than being allowed to block the apply loop (and therefore every write in
+// the cluster) waiting for it to catch up.
+func TestWatchDropsSlowSubscriber(t *testing.T) {
+	sm, cleanup := makeTestSM(t)
+	defer cleanup()
+
+	events, unsubscribe := sm.Subscribe("")
+	defer unsubscribe()
+
+	for i := 0; i < watchSubscriberBuffer+10; i++ {
+		key := fmt.Sprintf("k%d", i)
+		if err := sm.ProposeWrite(cmd("put", key, []byte("v"), "c1", uint64(i+1))); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case _, ok := <-events:
+			if !ok {
+				return // dropped, as expected
+			}
+		case <-deadline:
+			t.Fatal("subscriber was not dropped after exceeding its buffer")
 		}
 	}
 }

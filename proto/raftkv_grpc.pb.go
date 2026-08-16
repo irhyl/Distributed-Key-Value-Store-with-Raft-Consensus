@@ -204,6 +204,7 @@ const (
 	KVService_Get_FullMethodName    = "/raftkv.KVService/Get"
 	KVService_Put_FullMethodName    = "/raftkv.KVService/Put"
 	KVService_Delete_FullMethodName = "/raftkv.KVService/Delete"
+	KVService_Watch_FullMethodName  = "/raftkv.KVService/Watch"
 )
 
 // KVServiceClient is the client API for KVService service.
@@ -215,6 +216,7 @@ type KVServiceClient interface {
 	Get(ctx context.Context, in *GetRequest, opts ...grpc.CallOption) (*GetResponse, error)
 	Put(ctx context.Context, in *PutRequest, opts ...grpc.CallOption) (*PutResponse, error)
 	Delete(ctx context.Context, in *DeleteRequest, opts ...grpc.CallOption) (*DeleteResponse, error)
+	Watch(ctx context.Context, in *WatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ChangeEvent], error)
 }
 
 type kVServiceClient struct {
@@ -255,6 +257,25 @@ func (c *kVServiceClient) Delete(ctx context.Context, in *DeleteRequest, opts ..
 	return out, nil
 }
 
+func (c *kVServiceClient) Watch(ctx context.Context, in *WatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ChangeEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &KVService_ServiceDesc.Streams[0], KVService_Watch_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[WatchRequest, ChangeEvent]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type KVService_WatchClient = grpc.ServerStreamingClient[ChangeEvent]
+
 // KVServiceServer is the server API for KVService service.
 // All implementations must embed UnimplementedKVServiceServer
 // for forward compatibility.
@@ -264,6 +285,7 @@ type KVServiceServer interface {
 	Get(context.Context, *GetRequest) (*GetResponse, error)
 	Put(context.Context, *PutRequest) (*PutResponse, error)
 	Delete(context.Context, *DeleteRequest) (*DeleteResponse, error)
+	Watch(*WatchRequest, grpc.ServerStreamingServer[ChangeEvent]) error
 	mustEmbedUnimplementedKVServiceServer()
 }
 
@@ -282,6 +304,9 @@ func (UnimplementedKVServiceServer) Put(context.Context, *PutRequest) (*PutRespo
 }
 func (UnimplementedKVServiceServer) Delete(context.Context, *DeleteRequest) (*DeleteResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Delete not implemented")
+}
+func (UnimplementedKVServiceServer) Watch(*WatchRequest, grpc.ServerStreamingServer[ChangeEvent]) error {
+	return status.Error(codes.Unimplemented, "method Watch not implemented")
 }
 func (UnimplementedKVServiceServer) mustEmbedUnimplementedKVServiceServer() {}
 func (UnimplementedKVServiceServer) testEmbeddedByValue()                   {}
@@ -358,6 +383,17 @@ func _KVService_Delete_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _KVService_Watch_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(WatchRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(KVServiceServer).Watch(m, &grpc.GenericServerStream[WatchRequest, ChangeEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type KVService_WatchServer = grpc.ServerStreamingServer[ChangeEvent]
+
 // KVService_ServiceDesc is the grpc.ServiceDesc for KVService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -378,6 +414,12 @@ var KVService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _KVService_Delete_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "Watch",
+			Handler:       _KVService_Watch_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "proto/raftkv.proto",
 }

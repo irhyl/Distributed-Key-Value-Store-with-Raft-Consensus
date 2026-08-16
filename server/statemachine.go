@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	pb "github.com/raftkv/proto"
 	"github.com/raftkv/raft"
 	"github.com/raftkv/storage"
 )
@@ -63,6 +64,10 @@ type StateMachine struct {
 	// and compact the Raft log. 0 disables automatic snapshotting.
 	snapshotInterval uint64
 
+	// broadcaster fans out every applied write to Watch RPC subscribers
+	// (change data capture). See watch.go.
+	broadcaster *changeBroadcaster
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
@@ -84,11 +89,12 @@ func WithSnapshotInterval(interval uint64) Option {
 // NewStateMachine creates a state machine backed by engine, consuming from node.ApplyCh.
 func NewStateMachine(node *raft.Node, engine *storage.Engine, opts ...Option) *StateMachine {
 	sm := &StateMachine{
-		engine:  engine,
-		node:    node,
-		pending: make(map[uint64]*pendingWrite),
-		lastSeq: make(map[string]uint64),
-		stopCh:  make(chan struct{}),
+		engine:      engine,
+		node:        node,
+		pending:     make(map[uint64]*pendingWrite),
+		lastSeq:     make(map[string]uint64),
+		broadcaster: newChangeBroadcaster(),
+		stopCh:      make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(sm)
@@ -169,6 +175,16 @@ func (sm *StateMachine) ReadValue(key string) ([]byte, bool, error) {
 
 	val, found := sm.engine.Get(key)
 	return val, found, nil
+}
+
+// Subscribe registers a change-data-capture subscriber: every write applied
+// from this point on (matching keyPrefix, or all writes if empty) is sent
+// on the returned channel until the caller invokes the returned unsubscribe
+// function. The channel is closed if the subscriber falls too far behind
+// and is dropped — see changeBroadcaster.publish.
+func (sm *StateMachine) Subscribe(keyPrefix string) (<-chan *pb.ChangeEvent, func()) {
+	sub, unsubscribe := sm.broadcaster.subscribe(keyPrefix)
+	return sub.ch, unsubscribe
 }
 
 // ── Apply loop ────────────────────────────────────────────────────────────────
@@ -333,6 +349,23 @@ func (sm *StateMachine) apply(entry *raft.LogEntry) {
 		applyErr = fmt.Sprintf("unknown op: %q", cmd.Op)
 	}
 	recordOp(cmd.Op, applyErr)
+
+	// Change data capture: publish successful writes to any Watch
+	// subscribers, after the dedup/corrupt-entry short-circuits above so a
+	// skipped no-op retry never appears twice in the change stream.
+	if applyErr == "" {
+		opType := pb.OpType_OP_PUT
+		if cmd.Op == "delete" {
+			opType = pb.OpType_OP_DELETE
+		}
+		sm.broadcaster.publish(&pb.ChangeEvent{
+			Index: entry.Index,
+			Term:  entry.Term,
+			Op:    opType,
+			Key:   cmd.Key,
+			Value: cmd.Value,
+		})
+	}
 
 	// Update dedup tracker
 	if cmd.ClientID != "" && applyErr == "" {
