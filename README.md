@@ -119,7 +119,7 @@ Detailed write-ups for every layer are in [`docs/`](docs/):
 
 ### Prerequisites
 
-- Go 1.22+
+- Go 1.25+
 - `protoc` + plugins (only needed if you modify the `.proto` file)
 
 ```bash
@@ -263,6 +263,23 @@ server/      (9 tests)
 
 ---
 
+## Observability
+
+Pass `--metrics-listen=<addr>` to expose Prometheus metrics at `http://<addr>/metrics`:
+
+| Metric | Type | What it shows |
+| ------ | ---- | -------------- |
+| `raftkv_kv_ops_total{op,result}` | counter | Applied Put/Delete operations, by outcome |
+| `raftkv_commit_latency_seconds` | histogram | Time from `ProposeWrite` to commit + apply |
+| `raftkv_leader_elections_total` | counter | How many times this node became leader |
+| `raftkv_replication_lag_entries{peer}` | gauge | Log entries each peer is behind (leader-only) |
+| `raftkv_wal_fsync_seconds` | histogram | WAL fsync duration (single-entry and batch) |
+| `raftkv_compaction_duration_seconds` | histogram | LSM compaction run duration |
+
+`raft`, `wal`, and `storage` stay free of any dependency on Prometheus specifically — each exposes a plain optional callback hook (`Node.OnBecomeLeader`, `WAL.OnFsync`, `Engine.OnCompaction`), and `server/metrics.go` is the only file that imports a metrics library, wiring those hooks to Prometheus counters. Swapping backends later only touches that one file.
+
+---
+
 ## Key design decisions
 
 ### LSM tree over B-tree
@@ -290,10 +307,3 @@ A new leader may have entries from old terms in its log that were replicated to 
 This is Raft's leader completeness rule (Section 5.4 of the paper) and the most commonly misimplemented detail.
 
 ---
-
-## What's not implemented
-
-- **Membership changes** — The cluster topology is fixed at startup. Dynamic add/remove requires a two-phase joint consensus protocol (Raft Section 6).
-- **TLS** — Peer connections use plaintext gRPC. Production deployments should use mutual TLS between nodes.
-- **Leveled compaction** — The storage engine uses a simple "merge all SSTables" strategy. RocksDB-style leveled compaction would reduce write amplification significantly for large datasets.
-- **PreVote** — A partitioned node's election timer keeps firing with nobody to reset it, so its term climbs unboundedly for as long as it's disconnected. On reconnection that inflated term forces the legitimate leader through a series of disruptive step-downs before terms converge, even though the rejoining node's stale log means it can never actually win. Not a safety issue — just a liveness cost on reconnection. See [design-decisions.md](docs/design-decisions.md#no-prevote).

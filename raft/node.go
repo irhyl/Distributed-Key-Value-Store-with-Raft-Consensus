@@ -127,6 +127,13 @@ type Node struct {
 	ApplyCh chan ApplyMsg // application reads committed entries / snapshots from here
 	stopCh  chan struct{}
 	wg       sync.WaitGroup
+
+	// ── Optional instrumentation hooks ──
+	// nil-safe; unset by default so raft stays free of any dependency on a
+	// specific metrics backend. The server package wires these to
+	// Prometheus counters when metrics are enabled. Called with n.mu held —
+	// must not call back into any Node method that also takes n.mu.
+	OnBecomeLeader func()
 }
 
 // Transport is how a Raft node sends RPCs to its peers.
@@ -311,6 +318,31 @@ func (n *Node) SnapshotIndex() uint64 {
 	return n.lastIncludedIndex
 }
 
+// LastLogIndex returns this node's own last log index — paired with
+// MatchIndexes, lets a caller compute per-peer replication lag.
+func (n *Node) LastLogIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lastLogIndex()
+}
+
+// MatchIndexes returns a snapshot copy of the leader's per-peer replication
+// progress (highest log index known replicated to each peer), for
+// monitoring replication lag. Returns an empty map if this node isn't
+// currently leader — that bookkeeping is only meaningful while leading.
+func (n *Node) MatchIndexes() map[string]uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.role != RoleLeader {
+		return map[string]uint64{}
+	}
+	out := make(map[string]uint64, len(n.matchIndex))
+	for peerID, idx := range n.matchIndex {
+		out[peerID] = idx
+	}
+	return out
+}
+
 // ── Main event loop ────────────────────────────────────────────────────────────
 
 // run is the main goroutine. It processes timer events only;
@@ -434,6 +466,10 @@ func (n *Node) becomeLeader() {
 	n.sendHeartbeats()
 	n.resetHeartbeatTimer()
 	n.electionTimer.Stop()
+
+	if n.OnBecomeLeader != nil {
+		n.OnBecomeLeader()
+	}
 }
 
 // becomeFollower steps down to Follower, updating term if needed.

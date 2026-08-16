@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 	pb "github.com/raftkv/proto"
@@ -45,6 +46,11 @@ type WAL struct {
 	writer  *bufio.Writer
 	size    int64        // bytes written to current segment
 	lastIndex uint64     // highest log index written to WAL
+
+	// OnFsync, if set, is called after every batch fsync with how long the
+	// underlying Sync() call took. nil-safe, unset by default — keeps this
+	// package free of any dependency on a specific metrics backend.
+	OnFsync func(time.Duration)
 }
 
 // Open opens or creates a WAL in the given directory.
@@ -119,7 +125,7 @@ func (w *WAL) Append(entry *pb.LogEntry) error {
 	if err := w.writer.Flush(); err != nil {
 		return fmt.Errorf("wal: flush: %w", err)
 	}
-	if err := w.current.Sync(); err != nil {
+	if err := w.syncTimed(); err != nil {
 		return fmt.Errorf("wal: sync: %w", err)
 	}
 
@@ -159,7 +165,7 @@ func (w *WAL) AppendBatch(entries []*pb.LogEntry) error {
 	if err := w.writer.Flush(); err != nil {
 		return fmt.Errorf("wal: flush batch: %w", err)
 	}
-	return w.current.Sync()
+	return w.syncTimed()
 }
 
 // ReadAll replays the entire WAL from the beginning.
@@ -339,6 +345,17 @@ func (w *WAL) Close() error {
 }
 
 // ── Internal helpers ────────────────────────────────────────────────────────
+
+// syncTimed calls Sync() on the current segment and reports how long it
+// took via OnFsync, if set.
+func (w *WAL) syncTimed() error {
+	start := time.Now()
+	err := w.current.Sync()
+	if w.OnFsync != nil {
+		w.OnFsync(time.Since(start))
+	}
+	return err
+}
 
 // writeRecord writes a single [length][crc32][data] record.
 // Does NOT fsync — call Sync() or let AppendBatch do it.

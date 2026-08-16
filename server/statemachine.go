@@ -6,9 +6,11 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/raftkv/raft"
 	"github.com/raftkv/storage"
@@ -107,6 +109,7 @@ func (sm *StateMachine) Stop() {
 //
 // This is the critical path for client PUT and DELETE requests.
 func (sm *StateMachine) ProposeWrite(cmd Command) error {
+	start := time.Now()
 	data, err := json.Marshal(cmd)
 	if err != nil {
 		return fmt.Errorf("marshal command: %w", err)
@@ -137,8 +140,9 @@ func (sm *StateMachine) ProposeWrite(cmd Command) error {
 	// Block until the entry commits (apply loop sends on done) or we stop
 	select {
 	case result := <-done:
+		commitLatencySeconds.Observe(time.Since(start).Seconds())
 		if result.Err != "" {
-			return fmt.Errorf(result.Err)
+			return errors.New(result.Err)
 		}
 		return nil
 	case <-sm.stopCh:
@@ -328,6 +332,7 @@ func (sm *StateMachine) apply(entry *raft.LogEntry) {
 	default:
 		applyErr = fmt.Sprintf("unknown op: %q", cmd.Op)
 	}
+	recordOp(cmd.Op, applyErr)
 
 	// Update dedup tracker
 	if cmd.ClientID != "" && applyErr == "" {

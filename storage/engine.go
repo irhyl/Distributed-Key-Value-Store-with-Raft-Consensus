@@ -46,6 +46,11 @@ type Engine struct {
 
 	sstableSeq uint64 // atomic counter for SSTable filenames
 	closed     int32  // atomic bool
+
+	// OnCompaction, if set, is called after every compaction run with how
+	// long it took. nil-safe, unset by default — keeps this package free of
+	// any dependency on a specific metrics backend.
+	OnCompaction func(time.Duration)
 }
 
 // Open opens (or creates) an LSM engine at dir.
@@ -274,6 +279,11 @@ func (e *Engine) doCompaction() {
 
 	if len(toCompact) < 2 {
 		return
+	}
+
+	start := time.Now()
+	if e.OnCompaction != nil {
+		defer func() { e.OnCompaction(time.Since(start)) }()
 	}
 
 	// Read all entries from all SSTables (oldest first, so newer overwrites older)
