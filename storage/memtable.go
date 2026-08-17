@@ -15,11 +15,11 @@ import (
 )
 
 const (
-	maxMemtableSize = 4 * 1024 * 1024 // 4MB — flush to SSTable when exceeded
+	maxMemtableSize = 4 * 1024 * 1024 // 4MB - flush to SSTable when exceeded
 )
 
 // entryKind distinguishes live values from deletions.
-// Deletions are stored as "tombstones" — we can't just remove the key,
+// Deletions are stored as "tombstones" - we can't just remove the key,
 // because an older SSTable might still have the value. The tombstone
 // propagates through compaction until it reaches the oldest level.
 type entryKind uint8
@@ -34,7 +34,7 @@ type memEntry struct {
 	key   string
 	value []byte
 	kind  entryKind
-	seq   uint64 // sequence number — higher = newer (for MVCC-style reads)
+	seq   uint64 // sequence number - higher = newer (for MVCC-style reads)
 }
 
 // Memtable is a sorted, in-memory write buffer.
@@ -87,7 +87,7 @@ func (m *Memtable) Get(key string) ([]byte, bool) {
 
 	e := m.entries[idx]
 	if e.kind == kindDelete {
-		return nil, false // tombstone — key was deleted
+		return nil, false // tombstone - key was deleted
 	}
 	return e.value, true
 }

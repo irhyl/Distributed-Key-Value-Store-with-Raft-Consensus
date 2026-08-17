@@ -1,4 +1,4 @@
-// SSTable (Sorted String Table) — an immutable, sorted on-disk file.
+// SSTable (Sorted String Table) - an immutable, sorted on-disk file.
 //
 // On-disk layout:
 //
@@ -34,7 +34,7 @@ import (
 const (
 	sstMagic    = uint32(0xDEADB0B5)
 	bloomSize   = 1024 // bytes = 8192 bits; good for ~5000 keys at 1% FPR
-	bloomHashes = 7    // number of hash functions — optimal for our bloom size
+	bloomHashes = 7    // number of hash functions - optimal for our bloom size
 )
 
 // SSTableWriter builds a new SSTable file from a sorted list of entries.
@@ -172,11 +172,11 @@ func OpenSSTable(path string) (*SSTableReader, error) {
 // Returns (value, kindPut, true) if found, or (nil, *, false) if not.
 //
 // Performance path:
-//  1. Check bloom filter — O(1), avoids disk read if key definitely absent
-//  2. Scan data block — O(n) linear scan
+//  1. Check bloom filter - O(1), avoids disk read if key definitely absent
+//  2. Scan data block - O(n) linear scan
 //     (production: binary search on a separately stored index block)
 func (r *SSTableReader) Get(key string) ([]byte, entryKind, bool) {
-	// Bloom filter check — fast path
+	// Bloom filter check - fast path
 	if !r.bloom.mightContain(key) {
 		return nil, 0, false // definitely not in this file
 	}
@@ -232,7 +232,7 @@ func (r *SSTableReader) Get(key string) ([]byte, entryKind, bool) {
 		}
 	}
 
-	return nil, 0, false // bloom false positive — key not actually here
+	return nil, 0, false // bloom false positive - key not actually here
 }
 
 // IterateAll scans every entry in the SSTable in key order.
@@ -354,7 +354,7 @@ func (b *bloomFilter) hash(key string, seed uint32) uint32 {
 
 // MergeEntries merges multiple sorted entry slices into one sorted slice.
 // Later entries (higher index in the inputs slice) take precedence for the
-// same key — so pass newer SSTables last.
+// same key - so pass newer SSTables last.
 //
 // This is a k-way merge, like the merge step of merge sort.
 func MergeEntries(inputs [][]memEntry) []memEntry {
