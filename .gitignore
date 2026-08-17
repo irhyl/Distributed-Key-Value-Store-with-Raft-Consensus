@@ -1,6 +1,7 @@
 # Binaries
 raftkv-server
 raftkv-cli
+*.exe
 
 # Go build cache
 *.test
