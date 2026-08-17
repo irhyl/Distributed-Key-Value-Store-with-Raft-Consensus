@@ -6,10 +6,13 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
+	pb "github.com/raftkv/proto"
 	"github.com/raftkv/raft"
 	"github.com/raftkv/storage"
 )
@@ -21,7 +24,7 @@ type Command struct {
 	Key   string `json:"key"`
 	Value []byte `json:"value,omitempty"`
 
-	// Deduplication fields — a client attaches these to every write.
+	// Deduplication fields - a client attaches these to every write.
 	// The state machine ignores commands it has already applied.
 	ClientID string `json:"client_id,omitempty"`
 	SeqNum   uint64 `json:"seq_num,omitempty"`
@@ -57,18 +60,44 @@ type StateMachine struct {
 	// Requests with seqNum <= lastSeq[clientID] are silently skipped.
 	lastSeq map[string]uint64
 
+	// snapshotInterval: after every Nth applied entry, snapshot the engine
+	// and compact the Raft log. 0 disables automatic snapshotting.
+	snapshotInterval uint64
+
+	// broadcaster fans out every applied write to Watch RPC subscribers
+	// (change data capture). See watch.go.
+	broadcaster *changeBroadcaster
+
 	stopCh chan struct{}
 	wg     sync.WaitGroup
 }
 
-// NewStateMachine creates a state machine backed by engine, consuming from node.CommitCh.
-func NewStateMachine(node *raft.Node, engine *storage.Engine) *StateMachine {
+// Option configures a StateMachine at construction time.
+type Option func(*StateMachine)
+
+// WithSnapshotInterval makes the state machine snapshot the engine and
+// compact the Raft log every interval applied entries. Applied before the
+// apply loop goroutine starts, so setting it here - rather than mutating
+// the field after construction - avoids a data race with that goroutine
+// reading it.
+func WithSnapshotInterval(interval uint64) Option {
+	return func(sm *StateMachine) {
+		sm.snapshotInterval = interval
+	}
+}
+
+// NewStateMachine creates a state machine backed by engine, consuming from node.ApplyCh.
+func NewStateMachine(node *raft.Node, engine *storage.Engine, opts ...Option) *StateMachine {
 	sm := &StateMachine{
-		engine:  engine,
-		node:    node,
-		pending: make(map[uint64]*pendingWrite),
-		lastSeq: make(map[string]uint64),
-		stopCh:  make(chan struct{}),
+		engine:      engine,
+		node:        node,
+		pending:     make(map[uint64]*pendingWrite),
+		lastSeq:     make(map[string]uint64),
+		broadcaster: newChangeBroadcaster(),
+		stopCh:      make(chan struct{}),
+	}
+	for _, opt := range opts {
+		opt(sm)
 	}
 	sm.wg.Add(1)
 	go sm.applyLoop()
@@ -86,6 +115,7 @@ func (sm *StateMachine) Stop() {
 //
 // This is the critical path for client PUT and DELETE requests.
 func (sm *StateMachine) ProposeWrite(cmd Command) error {
+	start := time.Now()
 	data, err := json.Marshal(cmd)
 	if err != nil {
 		return fmt.Errorf("marshal command: %w", err)
@@ -94,13 +124,13 @@ func (sm *StateMachine) ProposeWrite(cmd Command) error {
 	// Hold sm.mu across Propose()+registration below. Propose() can commit
 	// and notify synchronously (e.g. the single-node fast path, where
 	// maybeAdvanceCommit runs inline and the apply loop may run before this
-	// function would otherwise register its waiter) — apply() takes the same
+	// function would otherwise register its waiter) - apply() takes the same
 	// lock before calling notifyPending, so registering under it here closes
 	// the race where a fast commit's notification arrives, finds no pending
 	// waiter yet, and is dropped, leaving this call blocked forever.
 	sm.mu.Lock()
 
-	// Submit to Raft — this appends to the local log and starts replication
+	// Submit to Raft - this appends to the local log and starts replication
 	logIndex, term, isLeader := sm.node.Propose(data)
 	if !isLeader {
 		sm.mu.Unlock()
@@ -116,8 +146,9 @@ func (sm *StateMachine) ProposeWrite(cmd Command) error {
 	// Block until the entry commits (apply loop sends on done) or we stop
 	select {
 	case result := <-done:
+		commitLatencySeconds.Observe(time.Since(start).Seconds())
 		if result.Err != "" {
-			return fmt.Errorf(result.Err)
+			return errors.New(result.Err)
 		}
 		return nil
 	case <-sm.stopCh:
@@ -146,29 +177,125 @@ func (sm *StateMachine) ReadValue(key string) ([]byte, bool, error) {
 	return val, found, nil
 }
 
+// Subscribe registers a change-data-capture subscriber: every write applied
+// from this point on (matching keyPrefix, or all writes if empty) is sent
+// on the returned channel until the caller invokes the returned unsubscribe
+// function. The channel is closed if the subscriber falls too far behind
+// and is dropped - see changeBroadcaster.publish.
+func (sm *StateMachine) Subscribe(keyPrefix string) (<-chan *pb.ChangeEvent, func()) {
+	sub, unsubscribe := sm.broadcaster.subscribe(keyPrefix)
+	return sub.ch, unsubscribe
+}
+
 // ── Apply loop ────────────────────────────────────────────────────────────────
 
-// applyLoop is the single goroutine that consumes CommitCh and calls apply().
-// Single-threaded application is deliberate: it ensures entries are applied
-// in strict log order, which is required for state machine safety.
+// applyLoop is the single goroutine that consumes ApplyCh and calls apply()
+// or applySnapshot(). Single-threaded application is deliberate: it ensures
+// entries are applied in strict log order, which is required for state
+// machine safety, and that a snapshot install never races with an in-flight
+// apply() of a normal entry.
 func (sm *StateMachine) applyLoop() {
 	defer sm.wg.Done()
 	for {
 		select {
-		case notify := <-sm.node.CommitCh:
-			sm.apply(notify.Entry)
+		case msg := <-sm.node.ApplyCh:
+			sm.dispatch(msg)
 		case <-sm.stopCh:
-			// Drain any remaining commits before exiting
+			// Drain any remaining messages before exiting
 			for {
 				select {
-				case notify := <-sm.node.CommitCh:
-					sm.apply(notify.Entry)
+				case msg := <-sm.node.ApplyCh:
+					sm.dispatch(msg)
 				default:
 					return
 				}
 			}
 		}
 	}
+}
+
+// dispatch routes a single ApplyCh message to the right handler.
+func (sm *StateMachine) dispatch(msg raft.ApplyMsg) {
+	switch {
+	case msg.CommandValid:
+		sm.apply(msg.Entry)
+		// Triggered here, after apply() has released sm.mu, rather than
+		// from inside apply() itself: snapshotting takes real engine I/O,
+		// and there's no reason to hold sm.mu (blocking ProposeWrite
+		// registration and LastApplied reads) for that. Still runs on this
+		// same single apply-loop goroutine, though - never concurrently
+		// with apply() of the next entry, which is what keeps a snapshot's
+		// contents and its recorded index consistent with each other.
+		if sm.snapshotInterval > 0 && msg.Entry.Index%sm.snapshotInterval == 0 {
+			sm.maybeSnapshot(msg.Entry.Index, msg.Entry.Term)
+		}
+	case msg.SnapshotValid:
+		sm.applySnapshot(msg)
+	}
+}
+
+// maybeSnapshot snapshots the engine's current state and asks Raft to
+// compact its log up to index. Errors are logged, not fatal: a failed
+// snapshot attempt just means the log stays uncompacted a bit longer and
+// gets retried at the next interval boundary - restart still falls back to
+// full WAL replay, which is slower but correct.
+func (sm *StateMachine) maybeSnapshot(index, term uint64) {
+	data, err := sm.engine.Snapshot()
+	if err != nil {
+		log.Printf("[statemachine] ERROR: create snapshot at index %d: %v", index, err)
+		return
+	}
+	if err := sm.node.CompactLog(data, index, term); err != nil {
+		log.Printf("[statemachine] ERROR: compact log at index %d: %v", index, err)
+	}
+}
+
+// applySnapshot installs a snapshot received via Raft's InstallSnapshot
+// (i.e. this node was far enough behind that the leader sent its full
+// state rather than individual log entries).
+func (sm *StateMachine) applySnapshot(msg raft.ApplyMsg) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	// Staleness guard, mirroring apply()'s: don't regress if we've already
+	// applied past what this snapshot covers (e.g. a delayed delivery that
+	// arrived after we'd already caught up some other way).
+	if msg.SnapshotIndex <= sm.lastApplied {
+		log.Printf("[statemachine] skipping stale snapshot at index %d (already applied through %d)",
+			msg.SnapshotIndex, sm.lastApplied)
+		return
+	}
+
+	if err := sm.engine.LoadSnapshot(msg.Snapshot); err != nil {
+		log.Printf("[statemachine] ERROR: load installed snapshot at index %d: %v", msg.SnapshotIndex, err)
+		return
+	}
+
+	// The snapshot folds in an unknown mix of clients' writes with no
+	// per-client sequence-number record of its own, so the dedup table has
+	// to be reset wholesale. Documented limitation: a client whose write
+	// was folded into the snapshot could in principle retry after this and
+	// be reapplied. Real systems like etcd embed the session table in the
+	// snapshot itself to avoid that; left out here to keep the snapshot
+	// format simple.
+	sm.lastSeq = make(map[string]uint64)
+
+	// Any pending write at or below the new baseline will never be
+	// individually delivered again - its entry, if it ever existed on this
+	// node, is now folded into the snapshot with no per-entry outcome to
+	// report. Resolve it now so the waiting client goroutine doesn't leak
+	// forever waiting on a notification that will never come.
+	for idx, pw := range sm.pending {
+		if idx <= msg.SnapshotIndex {
+			delete(sm.pending, idx)
+			select {
+			case pw.done <- Result{Err: "entry superseded by an installed snapshot"}:
+			default:
+			}
+		}
+	}
+
+	sm.lastApplied = msg.SnapshotIndex
 }
 
 // apply executes a single committed log entry against the storage engine.
@@ -188,7 +315,7 @@ func (sm *StateMachine) apply(entry *raft.LogEntry) {
 	// Decode the command
 	var cmd Command
 	if err := json.Unmarshal(entry.Data, &cmd); err != nil {
-		// Malformed entry — log and skip. In production: trigger a panic or
+		// Malformed entry - log and skip. In production: trigger a panic or
 		// leader-side validation to prevent bad entries ever reaching the log.
 		log.Printf("[statemachine] ERROR: unmarshal entry %d: %v", entry.Index, err)
 		sm.lastApplied = entry.Index
@@ -221,6 +348,24 @@ func (sm *StateMachine) apply(entry *raft.LogEntry) {
 	default:
 		applyErr = fmt.Sprintf("unknown op: %q", cmd.Op)
 	}
+	recordOp(cmd.Op, applyErr)
+
+	// Change data capture: publish successful writes to any Watch
+	// subscribers, after the dedup/corrupt-entry short-circuits above so a
+	// skipped no-op retry never appears twice in the change stream.
+	if applyErr == "" {
+		opType := pb.OpType_OP_PUT
+		if cmd.Op == "delete" {
+			opType = pb.OpType_OP_DELETE
+		}
+		sm.broadcaster.publish(&pb.ChangeEvent{
+			Index: entry.Index,
+			Term:  entry.Term,
+			Op:    opType,
+			Key:   cmd.Key,
+			Value: cmd.Value,
+		})
+	}
 
 	// Update dedup tracker
 	if cmd.ClientID != "" && applyErr == "" {
@@ -235,7 +380,7 @@ func (sm *StateMachine) apply(entry *raft.LogEntry) {
 
 // notifyPending unblocks a waiting client RPC for the given log index.
 // If the pending write's term doesn't match the current entry's term, it means
-// a new leader re-used this index with a different command — the original client
+// a new leader re-used this index with a different command - the original client
 // must retry (its command was never committed).
 func (sm *StateMachine) notifyPending(logIndex uint64, result Result) {
 	pw, ok := sm.pending[logIndex]
