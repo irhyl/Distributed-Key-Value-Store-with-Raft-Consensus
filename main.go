@@ -1,4 +1,4 @@
-// main.go — entry point for the raftkv server binary.
+// main.go - entry point for the raftkv server binary.
 //
 // Usage:
 //   raftkv-server \
@@ -21,10 +21,11 @@ import (
 )
 
 func main() {
-	id       := flag.String("id",       "",  "unique node ID (e.g. node1)")
-	listen   := flag.String("listen",   "",  "gRPC listen address (e.g. localhost:7001)")
-	peersStr := flag.String("peers",    "",  "comma-separated peerID=addr pairs for OTHER nodes")
-	dataDir  := flag.String("data-dir", "",  "directory for WAL and SSTable storage")
+	id            := flag.String("id",             "",  "unique node ID (e.g. node1)")
+	listen        := flag.String("listen",         "",  "gRPC listen address (e.g. localhost:7001)")
+	peersStr      := flag.String("peers",          "",  "comma-separated peerID=addr pairs for OTHER nodes")
+	dataDir       := flag.String("data-dir",       "",  "directory for WAL and SSTable storage")
+	metricsListen := flag.String("metrics-listen", "",  "if set, serve Prometheus metrics at http://<addr>/metrics (e.g. localhost:9091)")
 	flag.Parse()
 
 	if *id == "" || *listen == "" || *dataDir == "" {
@@ -36,10 +37,11 @@ func main() {
 	log.Printf("starting node %s on %s (peers: %v)", *id, *listen, peers)
 
 	cfg := server.Config{
-		NodeID:     *id,
-		ListenAddr: *listen,
-		Peers:      peers,
-		DataDir:    *dataDir,
+		NodeID:      *id,
+		ListenAddr:  *listen,
+		Peers:       peers,
+		DataDir:     *dataDir,
+		MetricsAddr: *metricsListen,
 	}
 
 	srv, err := server.NewKVServer(cfg)
