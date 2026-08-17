@@ -4,7 +4,7 @@
 
 Unit tests prove that individual components behave correctly in isolation. Integration tests prove that components work together under normal conditions. Neither proves that the system is correct when things go wrong at the worst possible moment.
 
-Chaos testing fills this gap. It deliberately injects failures — random node kills, during active writes — and then verifies that the system's safety guarantees held throughout.
+Chaos testing fills this gap. It deliberately injects failures - random node kills, during active writes - and then verifies that the system's safety guarantees held throughout.
 
 For a distributed system, the safety guarantee is: **every write that received an OK response must remain readable with the correct value, even if nodes crash during or after the write.**
 
@@ -24,9 +24,9 @@ Source: [chaos/chaos.py](../chaos/chaos.py)
 │  ┌──────────────────────────┐  ┌──────────────────────────────┐ │
 │  │  Write workers (4×)      │  │  Chaos worker                │ │
 │  │                          │  │                              │ │
-│  │  for 50 writes each:     │  │  every 1.5–3s:               │ │
+│  │  for 50 writes each:     │  │  every 1.5-3s:               │ │
 │  │    PUT w00-k0001 → val   │  │    KILL a random node        │ │
-│  │    record (key, val,     │  │    wait 1–2s                 │ │
+│  │    record (key, val,     │  │    wait 1-2s                 │ │
 │  │      confirmed=OK?)      │  │    RESTART that node         │ │
 │  │    ...                   │  │                              │ │
 │  └──────────────────────────┘  └──────────────────────────────┘ │
@@ -55,7 +55,7 @@ A write is **confirmed** if the CLI process exited with code 0 and printed `OK`.
 - The leader applied it to its state machine
 - The leader responded to the client
 
-An unconfirmed write (timeout, connection refused, non-zero exit) may or may not have committed. The test does not verify unconfirmed writes — they might be in the log on some nodes or they might not. Both outcomes are correct.
+An unconfirmed write (timeout, connection refused, non-zero exit) may or may not have committed. The test does not verify unconfirmed writes - they might be in the log on some nodes or they might not. Both outcomes are correct.
 
 Only confirmed writes are checked in the verification phase. This is the right invariant: **an OK response is a durability promise.**
 
@@ -72,9 +72,9 @@ During a typical 3-round chaos test with 4 workers and 50 writes each:
 | Leader crash after commit, before response | Write committed on majority, leader dies before client sees OK |
 | Node restart and log replay | Killed node restarts, replays WAL, catches up via AppendEntries |
 | Election during active writes | New leader elected; pending writes either committed or retried |
-| Minority partition | If we kill 2/3 nodes, writes start failing (expected — no majority) |
+| Minority partition | If we kill 2/3 nodes, writes start failing (expected - no majority) |
 
-The chaos worker deliberately avoids killing the last alive node (`len(alive) <= 1 → skip`), since a 1-node partition can never commit — writes would hang indefinitely and the test would timeout rather than catching bugs.
+The chaos worker deliberately avoids killing the last alive node (`len(alive) <= 1 → skip`), since a 1-node partition can never commit - writes would hang indefinitely and the test would timeout rather than catching bugs.
 
 ---
 
@@ -97,7 +97,7 @@ The unit test `TestNoCommitWithMinorityPartition` checks that an isolated leader
 - A new leader is elected with a log that includes entry 5 (from the WAL on a follower)
 - The new leader must not re-commit entry 5 with a different value
 
-This scenario requires real timing and real process crashes to reproduce reliably. The chaos test creates these conditions by randomly killing processes while writes are in flight — which hits timing windows that are impossible to exercise in a deterministic unit test.
+This scenario requires real timing and real process crashes to reproduce reliably. The chaos test creates these conditions by randomly killing processes while writes are in flight - which hits timing windows that are impossible to exercise in a deterministic unit test.
 
 Similarly, the WAL truncation path (`TruncateSuffix`) is rarely hit in unit tests but gets exercised every time a node restarts after being killed mid-replication and discovers its log conflicts with the new leader.
 
@@ -152,7 +152,7 @@ python3 chaos/chaos.py \
 
 A pass means: all 187 writes that returned OK are still readable with their original values.
 
-The 13 "failed" writes timed out or hit errors during the kill window — those may or may not have committed (the client never got an OK), so they are not checked.
+The 13 "failed" writes timed out or hit errors during the kill window - those may or may not have committed (the client never got an OK), so they are not checked.
 
 ---
 
@@ -193,6 +193,6 @@ proc = subprocess.Popen(cmd, stdout=DEVNULL, stderr=DEVNULL)
 
 Each round uses a fresh temporary directory (`tempfile.TemporaryDirectory`), so there is no leftover state between rounds. This ensures each round starts from a clean slate.
 
-Node kills use `SIGKILL` (not `SIGTERM`) to simulate a hard crash — no graceful shutdown, no final WAL flush, no cleanup. This is the most adversarial scenario.
+Node kills use `SIGKILL` (not `SIGTERM`) to simulate a hard crash - no graceful shutdown, no final WAL flush, no cleanup. This is the most adversarial scenario.
 
 Node restarts reuse the same data directory, so the WAL from before the kill is available for replay. This exercises the recovery path on every restart.
