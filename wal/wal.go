@@ -8,7 +8,7 @@
 // On-disk format for each record:
 //   [4 bytes: payload length] [4 bytes: CRC32 checksum] [N bytes: payload]
 //
-// The checksum lets us detect truncated or corrupted writes —
+// The checksum lets us detect truncated or corrupted writes -
 // a common failure mode when a machine loses power mid-write.
 
 package wal
@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"google.golang.org/protobuf/proto"
 	pb "github.com/raftkv/proto"
@@ -37,7 +38,7 @@ const (
 )
 
 // WAL is a write-ahead log that persists Raft log entries to disk.
-// It's safe for concurrent use — a single writer, multiple readers pattern.
+// It's safe for concurrent use - a single writer, multiple readers pattern.
 type WAL struct {
 	mu      sync.Mutex
 	dir     string       // directory holding segment files
@@ -45,6 +46,11 @@ type WAL struct {
 	writer  *bufio.Writer
 	size    int64        // bytes written to current segment
 	lastIndex uint64     // highest log index written to WAL
+
+	// OnFsync, if set, is called after every batch fsync with how long the
+	// underlying Sync() call took. nil-safe, unset by default - keeps this
+	// package free of any dependency on a specific metrics backend.
+	OnFsync func(time.Duration)
 }
 
 // Open opens or creates a WAL in the given directory.
@@ -64,7 +70,7 @@ func Open(dir string) (*WAL, error) {
 	}
 
 	if len(segments) == 0 {
-		// Fresh start — create the first segment
+		// Fresh start - create the first segment
 		if err := w.createSegment(1); err != nil {
 			return nil, err
 		}
@@ -119,7 +125,7 @@ func (w *WAL) Append(entry *pb.LogEntry) error {
 	if err := w.writer.Flush(); err != nil {
 		return fmt.Errorf("wal: flush: %w", err)
 	}
-	if err := w.current.Sync(); err != nil {
+	if err := w.syncTimed(); err != nil {
 		return fmt.Errorf("wal: sync: %w", err)
 	}
 
@@ -128,7 +134,7 @@ func (w *WAL) Append(entry *pb.LogEntry) error {
 }
 
 // AppendBatch writes multiple entries atomically (single fsync).
-// This is a critical optimization — Raft can replicate many entries at once,
+// This is a critical optimization - Raft can replicate many entries at once,
 // and fsyncing each one separately would be prohibitively slow.
 func (w *WAL) AppendBatch(entries []*pb.LogEntry) error {
 	if len(entries) == 0 {
@@ -155,11 +161,11 @@ func (w *WAL) AppendBatch(entries []*pb.LogEntry) error {
 		w.lastIndex = entry.Index
 	}
 
-	// Single fsync for the whole batch — huge throughput improvement
+	// Single fsync for the whole batch - huge throughput improvement
 	if err := w.writer.Flush(); err != nil {
 		return fmt.Errorf("wal: flush batch: %w", err)
 	}
-	return w.current.Sync()
+	return w.syncTimed()
 }
 
 // ReadAll replays the entire WAL from the beginning.
@@ -248,6 +254,76 @@ func (w *WAL) TruncateSuffix(keepIndex uint64) error {
 	return w.current.Sync()
 }
 
+// TruncatePrefix removes all entries with index <= discardIndex.
+// Called after a Raft snapshot has been taken: everything up to and
+// including discardIndex is now captured in the snapshot, so replaying it
+// from the WAL on restart is no longer necessary. Mirrors TruncateSuffix's
+// close-before-remove handling (required on Windows, where an open file
+// cannot be deleted) and rewrite-from-scratch approach.
+func (w *WAL) TruncatePrefix(discardIndex uint64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.writer != nil {
+		w.writer.Flush()
+	}
+	if w.current != nil {
+		w.current.Close()
+		w.current = nil
+		w.writer = nil
+	}
+
+	// Read all entries, rewrite only those we want to keep
+	segments, _ := filepath.Glob(filepath.Join(w.dir, "*.wal"))
+	var keep []*pb.LogEntry
+	for _, seg := range segments {
+		entries, err := readSegment(seg)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			if e.Index > discardIndex {
+				keep = append(keep, e)
+			}
+		}
+	}
+
+	// Remove all segment files and rewrite from scratch
+	for _, seg := range segments {
+		if err := os.Remove(seg); err != nil {
+			return fmt.Errorf("wal: remove segment %s: %w", seg, err)
+		}
+	}
+
+	w.current = nil
+	w.size = 0
+	// Even with nothing left to keep, the log logically continues from
+	// discardIndex - the next Append() picks up at discardIndex+1, it does
+	// not restart from 1. Set this now; the loop below overwrites it with
+	// the actual last kept index if there is one.
+	w.lastIndex = discardIndex
+
+	if err := w.createSegment(discardIndex + 1); err != nil {
+		return err
+	}
+
+	for _, e := range keep {
+		data, err := proto.Marshal(e)
+		if err != nil {
+			return fmt.Errorf("wal: truncate marshal entry %d: %w", e.Index, err)
+		}
+		if err := w.writeRecord(data); err != nil {
+			return fmt.Errorf("wal: truncate rewrite entry %d: %w", e.Index, err)
+		}
+		w.lastIndex = e.Index
+	}
+
+	if err := w.writer.Flush(); err != nil {
+		return fmt.Errorf("wal: flush after truncate prefix: %w", err)
+	}
+	return w.current.Sync()
+}
+
 // LastIndex returns the index of the most recent entry in the WAL.
 func (w *WAL) LastIndex() uint64 {
 	w.mu.Lock()
@@ -270,8 +346,19 @@ func (w *WAL) Close() error {
 
 // ── Internal helpers ────────────────────────────────────────────────────────
 
+// syncTimed calls Sync() on the current segment and reports how long it
+// took via OnFsync, if set.
+func (w *WAL) syncTimed() error {
+	start := time.Now()
+	err := w.current.Sync()
+	if w.OnFsync != nil {
+		w.OnFsync(time.Since(start))
+	}
+	return err
+}
+
 // writeRecord writes a single [length][crc32][data] record.
-// Does NOT fsync — call Sync() or let AppendBatch do it.
+// Does NOT fsync - call Sync() or let AppendBatch do it.
 func (w *WAL) writeRecord(data []byte) error {
 	checksum := crc32.ChecksumIEEE(data)
 
@@ -348,7 +435,7 @@ func readSegment(path string) ([]*pb.LogEntry, error) {
 		var header [headerSize]byte
 		if _, err := io.ReadFull(reader, header[:]); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break // clean end or partial write at tail — stop here
+				break // clean end or partial write at tail - stop here
 			}
 			return nil, fmt.Errorf("read header: %w", err)
 		}
@@ -359,14 +446,14 @@ func readSegment(path string) ([]*pb.LogEntry, error) {
 		// Read payload
 		data := make([]byte, length)
 		if _, err := io.ReadFull(reader, data); err != nil {
-			// Partial write — this record is corrupt, stop here
+			// Partial write - this record is corrupt, stop here
 			break
 		}
 
 		// Verify checksum
 		actualCRC := crc32.ChecksumIEEE(data)
 		if actualCRC != expectedCRC {
-			// Corrupted record — stop; don't return an error,
+			// Corrupted record - stop; don't return an error,
 			// because a corruption at the tail is a known crash scenario
 			break
 		}
