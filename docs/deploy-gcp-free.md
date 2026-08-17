@@ -81,6 +81,13 @@ go run ./client --peers node1=$EXTERNAL_IP:7001,node2=$EXTERNAL_IP:7002,node3=$E
 go run ./client --peers node1=$EXTERNAL_IP:7001,node2=$EXTERNAL_IP:7002,node3=$EXTERNAL_IP:7003 get hello
 ```
 
+Run this from a genuinely separate machine, not the VM itself. GCP does not
+route a VM's own traffic back in through its external IP, so testing from
+inside the VM against its own public address just times out. If you're
+testing from Cloud Shell instead of a local machine, remember its egress IP
+can change between sessions, so re-check it against the firewall rule's
+`--source-ranges` if a request that worked before suddenly stops connecting.
+
 Or just SSH into the VM and use the CLI locally the same way the
 docker-compose usage examples in the main README show.
 
@@ -93,12 +100,3 @@ any, inside the free limits):
 gcloud compute instances delete raftkv-demo --zone=us-central1-a
 gcloud compute firewall-rules delete raftkv-demo
 ```
-
-## If you want real multi-machine fault tolerance instead
-
-New GCP accounts get a $300 / 90-day credit, which covers running one VM per
-node (3 total) well past the point of demonstrating a real node failure and
-recovery over the network. That setup isn't part of this repo yet; it
-would mean three `e2-small` instances instead of one shared `e2-micro`, each
-running a single `raftkv-server` process directly rather than through
-compose, with `--peers` pointing at the other two VMs' internal IPs.
