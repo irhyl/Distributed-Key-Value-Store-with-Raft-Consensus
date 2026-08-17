@@ -1,4 +1,4 @@
-// transport.go — gRPC implementation of raft.Transport.
+// transport.go - gRPC implementation of raft.Transport.
 // This replaces memtransport.go for production; nodes communicate over the network.
 
 package server
@@ -94,7 +94,7 @@ func (t *GRPCTransport) getClient(peerID string) (pb.RaftServiceClient, error) {
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer dialCancel()
 	// DialContext+WithBlock is deprecated in favor of NewClient, but NewClient
-	// connects lazily on first RPC — we need dial itself to fail within this
+	// connects lazily on first RPC - we need dial itself to fail within this
 	// short timeout so an unreachable peer is detected quickly, not on the
 	// next heartbeat's RPC call.
 	conn, err := grpc.DialContext(dialCtx, addr, //nolint:staticcheck
