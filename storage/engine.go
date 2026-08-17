@@ -46,6 +46,11 @@ type Engine struct {
 
 	sstableSeq uint64 // atomic counter for SSTable filenames
 	closed     int32  // atomic bool
+
+	// OnCompaction, if set, is called after every compaction run with how
+	// long it took. nil-safe, unset by default - keeps this package free of
+	// any dependency on a specific metrics backend.
+	OnCompaction func(time.Duration)
 }
 
 // Open opens (or creates) an LSM engine at dir.
@@ -135,7 +140,7 @@ func (e *Engine) Get(key string) ([]byte, bool) {
 		val, kind, found := sst.Get(key)
 		if found {
 			if kind == kindDelete {
-				return nil, false // tombstone — key was deleted
+				return nil, false // tombstone - key was deleted
 			}
 			return val, true
 		}
@@ -186,7 +191,7 @@ func (e *Engine) flushWorker() {
 func (e *Engine) rotateAndFlush() {
 	e.mu.Lock()
 	if e.immutable != nil {
-		// Previous flush still in progress — skip this cycle
+		// Previous flush still in progress - skip this cycle
 		e.mu.Unlock()
 		return
 	}
@@ -276,6 +281,11 @@ func (e *Engine) doCompaction() {
 		return
 	}
 
+	start := time.Now()
+	if e.OnCompaction != nil {
+		defer func() { e.OnCompaction(time.Since(start)) }()
+	}
+
 	// Read all entries from all SSTables (oldest first, so newer overwrites older)
 	// We reverse the slice because sstables is newest-first
 	var inputs [][]memEntry
@@ -335,7 +345,7 @@ func (e *Engine) loadSSTables() error {
 		return err
 	}
 
-	// Sort paths — they're named by sequence number so lexicographic = chronological
+	// Sort paths - they're named by sequence number so lexicographic = chronological
 	sort.Sort(sort.Reverse(sort.StringSlice(paths))) // newest first
 
 	e.sstables = make([]*SSTableReader, 0, len(paths))

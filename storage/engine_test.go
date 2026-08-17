@@ -223,6 +223,89 @@ func TestEngineCompaction(t *testing.T) {
 	}
 }
 
+func TestEngineSnapshotRoundTrip(t *testing.T) {
+	srcDir, _ := os.MkdirTemp("", "engine-snap-src-*")
+	defer os.RemoveAll(srcDir)
+
+	src, _ := Open(srcDir)
+	defer src.Close()
+
+	// Enough entries to force at least one background flush to an SSTable,
+	// so the snapshot must merge disk-resident data, not just the memtable.
+	for i := 0; i < 200; i++ {
+		src.Put(fmt.Sprintf("snapkey-%03d", i), []byte(fmt.Sprintf("val-%03d", i)))
+	}
+	time.Sleep(100 * time.Millisecond) // let a background flush happen if triggered
+
+	// A few more writes stay in the active memtable only.
+	src.Put("fresh", []byte("still-in-memtable"))
+
+	// Overwrite and delete should both be reflected correctly in the snapshot.
+	src.Put("snapkey-000", []byte("overwritten"))
+	src.Delete("snapkey-001")
+
+	snap, err := src.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if len(snap) == 0 {
+		t.Fatal("snapshot: empty output")
+	}
+
+	dstDir, _ := os.MkdirTemp("", "engine-snap-dst-*")
+	defer os.RemoveAll(dstDir)
+
+	dst, err := Open(dstDir)
+	if err != nil {
+		t.Fatalf("open dst: %v", err)
+	}
+	defer dst.Close()
+
+	if err := dst.LoadSnapshot(snap); err != nil {
+		t.Fatalf("load snapshot: %v", err)
+	}
+
+	for i := 0; i < 200; i++ {
+		key := fmt.Sprintf("snapkey-%03d", i)
+		switch i {
+		case 0:
+			val, ok := dst.Get(key)
+			if !ok || string(val) != "overwritten" {
+				t.Fatalf("get %s = %q %v, want %q", key, val, ok, "overwritten")
+			}
+		case 1:
+			if _, ok := dst.Get(key); ok {
+				t.Fatalf("get %s: want deleted, found a value", key)
+			}
+		default:
+			expected := fmt.Sprintf("val-%03d", i)
+			val, ok := dst.Get(key)
+			if !ok || string(val) != expected {
+				t.Fatalf("get %s = %q %v, want %q", key, val, ok, expected)
+			}
+		}
+	}
+
+	val, ok := dst.Get("fresh")
+	if !ok || string(val) != "still-in-memtable" {
+		t.Fatalf("get fresh = %q %v, want %q", val, ok, "still-in-memtable")
+	}
+
+	// The loaded snapshot must be durable - it should survive a restart of
+	// the destination engine without replaying anything from src.
+	dst.Close()
+	dst2, err := Open(dstDir)
+	if err != nil {
+		t.Fatalf("reopen dst: %v", err)
+	}
+	defer dst2.Close()
+
+	val, ok = dst2.Get("snapkey-002")
+	if !ok || string(val) != "val-002" {
+		t.Fatalf("after restart: get snapkey-002 = %q %v", val, ok)
+	}
+}
+
 func BenchmarkEnginePut(b *testing.B) {
 	dir, _ := os.MkdirTemp("", "engine-bench-*")
 	defer os.RemoveAll(dir)
