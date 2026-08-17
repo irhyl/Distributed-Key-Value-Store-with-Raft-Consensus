@@ -114,7 +114,7 @@ Detailed write-ups for every layer are in [`docs/`](docs/):
 | [client.md](docs/client.md) | CLI usage, leader redirection, retry logic |
 | [chaos-testing.md](docs/chaos-testing.md) | What the harness proves, failure scenarios, interpreting violations |
 | [design-decisions.md](docs/design-decisions.md) | 15 annotated decisions with alternatives and trade-offs |
-| [deploy-gcp-free.md](docs/deploy-gcp-free.md) | Running the cluster on a GCP Always Free VM, $0/month |
+| [deploy-gcp-free.md](docs/deploy-gcp-free.md) | Running the cluster on a GCP Always Free VM, $0/month (verified end to end) |
 
 ---
 
