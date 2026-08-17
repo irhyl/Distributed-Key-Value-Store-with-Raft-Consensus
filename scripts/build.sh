@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh — builds all binaries and runs the full test suite.
+# build.sh - builds all binaries and runs the full test suite.
 set -euo pipefail
 
 echo "==> Tidying modules..."
