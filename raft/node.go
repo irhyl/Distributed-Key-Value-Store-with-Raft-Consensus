@@ -7,7 +7,7 @@
 //   - State machine safety: if a server applies an entry at index N, no other server
 //     applies a different entry at index N
 //
-// This file: the core Node — state machine, RPC handlers, election timer, log replication.
+// This file: the core Node - state machine, RPC handlers, election timer, log replication.
 
 package raft
 
@@ -43,14 +43,34 @@ const (
 	// Leader sends heartbeats at this interval to prevent followers from timing out.
 	// Must be << electionTimeoutMin.
 	heartbeatInterval = 50 * time.Millisecond
+
+	// snapshotChunkSize bounds a single InstallSnapshot RPC's payload so a
+	// large snapshot doesn't block a peer connection with one huge message.
+	snapshotChunkSize = 1 << 20 // 1MB
 )
 
 // LogEntry wraps the proto type with a convenience constructor.
 type LogEntry = pb.LogEntry
 
-// CommitNotify is sent on the commitCh whenever entries are newly committed.
-type CommitNotify struct {
-	Entry *LogEntry
+// ApplyMsg is sent on ApplyCh whenever there's something new for the
+// application layer to apply: either a newly committed log entry, or an
+// installed snapshot that should replace all prior state. Shape modeled on
+// the standard MIT 6.5840 Raft lab ApplyMsg.
+type ApplyMsg struct {
+	CommandValid bool
+	Entry        *LogEntry
+
+	SnapshotValid bool
+	Snapshot      []byte
+	SnapshotIndex uint64
+	SnapshotTerm  uint64
+}
+
+// snapshotRecvState tracks reassembly of a chunked InstallSnapshot transfer.
+type snapshotRecvState struct {
+	lastIncludedIndex uint64
+	lastIncludedTerm  uint64
+	data              []byte
 }
 
 // Config holds the static configuration for a Raft node.
@@ -61,21 +81,35 @@ type Config struct {
 }
 
 // Node is a single Raft participant.
-// It communicates with peers via the Transport interface and
-// notifies the application layer of committed entries via CommitCh.
+// It communicates with peers via the Transport interface and notifies the
+// application layer of committed entries and installed snapshots via ApplyCh.
 type Node struct {
 	mu  sync.Mutex
 	cfg Config
 
-	// ── Persistent state (must survive crash — stored in WAL) ──
-	currentTerm uint64     // latest term this node has seen
-	votedFor    string     // candidateID we voted for in currentTerm (or "")
-	log         []*LogEntry // the replicated log (index 0 = dummy entry)
+	// ── Persistent state (must survive crash - stored in WAL) ──
+	currentTerm uint64      // latest term this node has seen
+	votedFor    string      // candidateID we voted for in currentTerm (or "")
+	log         []*LogEntry // the replicated log tail still held in memory
+
+	// lastIncludedIndex/Term describe the most recent snapshot: everything up
+	// to and including this index has been compacted out of log/storage.
+	// log[0] is always a sentinel entry {Index: lastIncludedIndex, Term:
+	// lastIncludedTerm} - generalizing the pre-snapshot convention where
+	// log[0] was the fixed {0,0} dummy entry. Use logPos() to translate a
+	// Raft log index into a position in log; never index log[] directly with
+	// a raw Raft index.
+	lastIncludedIndex uint64
+	lastIncludedTerm  uint64
 
 	// ── Volatile state (reconstructed after crash) ──
 	role        Role
 	leaderID    string // current leader's ID; updated on every valid AppendEntries
 	commitIndex uint64 // highest log index known to be committed
+
+	// recvSnapshot accumulates chunks of an in-progress InstallSnapshot
+	// transfer from the leader. nil except mid-transfer.
+	recvSnapshot *snapshotRecvState
 
 	// ── Leader-only volatile state (reinitialized after each election) ──
 	nextIndex  map[string]uint64 // for each peer: next log index to send
@@ -90,9 +124,16 @@ type Node struct {
 	heartbeatTimer *time.Timer
 
 	// ── Channels ──
-	CommitCh chan CommitNotify // application reads committed entries from here
-	stopCh   chan struct{}
+	ApplyCh chan ApplyMsg // application reads committed entries / snapshots from here
+	stopCh  chan struct{}
 	wg       sync.WaitGroup
+
+	// ── Optional instrumentation hooks ──
+	// nil-safe; unset by default so raft stays free of any dependency on a
+	// specific metrics backend. The server package wires these to
+	// Prometheus counters when metrics are enabled. Called with n.mu held -
+	// must not call back into any Node method that also takes n.mu.
+	OnBecomeLeader func()
 }
 
 // Transport is how a Raft node sends RPCs to its peers.
@@ -111,6 +152,26 @@ type PersistentState interface {
 	AppendEntries(entries []*LogEntry) error
 	LoadEntries() ([]*LogEntry, error)
 	TruncateSuffix(keepIndex uint64) error
+
+	// SaveSnapshot durably persists snapshot data along with the Raft index
+	// and term it covers. Must be atomic with respect to crashes: a reader
+	// must never observe a partially-written snapshot.
+	SaveSnapshot(data []byte, lastIncludedIndex, lastIncludedTerm uint64) error
+	// LoadSnapshot returns the most recently saved snapshot, or a nil data
+	// slice with lastIncludedIndex 0 if none has ever been saved.
+	LoadSnapshot() (data []byte, lastIncludedIndex, lastIncludedTerm uint64, err error)
+	// LoadSnapshotMeta is LoadSnapshot without the data bytes - same
+	// (lastIncludedIndex, lastIncludedTerm), without the I/O cost of
+	// reading a potentially large snapshot blob just to discard it. Used on
+	// every Start(): a normal restart only needs the metadata to seed
+	// commitIndex/log correctly (this node's own storage.Engine already has
+	// the actual state from its own on-disk SSTables); the data bytes only
+	// matter when a peer needs them via InstallSnapshot, which reads them
+	// lazily via LoadSnapshot at that point instead.
+	LoadSnapshotMeta() (lastIncludedIndex, lastIncludedTerm uint64, err error)
+	// TruncatePrefix removes all log entries with index <= discardIndex,
+	// called after a snapshot covering them has been durably saved.
+	TruncatePrefix(discardIndex uint64) error
 }
 
 // NewNode creates a new Raft node. Call Start() to begin participating.
@@ -120,7 +181,7 @@ func NewNode(cfg Config, transport Transport, storage PersistentState) *Node {
 		role:      RoleFollower,
 		transport: transport,
 		storage:   storage,
-		CommitCh:  make(chan CommitNotify, 4096),
+		ApplyCh:   make(chan ApplyMsg, 4096),
 		stopCh:    make(chan struct{}),
 		nextIndex:  make(map[string]uint64),
 		matchIndex: make(map[string]uint64),
@@ -135,6 +196,27 @@ func NewNode(cfg Config, transport Transport, storage PersistentState) *Node {
 
 // Start loads persisted state and begins the Raft protocol.
 func (n *Node) Start() error {
+	// Recover snapshot metadata first, if any. This seeds where our
+	// in-memory log begins so we don't need entries the snapshot already
+	// covers, and lets commitIndex start from the snapshot's index instead
+	// of 0 - replaying already-committed history on every restart is exactly
+	// what snapshotting exists to avoid. Uses LoadSnapshotMeta, not
+	// LoadSnapshot: the snapshot bytes themselves are NOT reapplied here
+	// (this node's own storage.Engine already reflects this state, or
+	// newer, from its own on-disk SSTables - the bytes only matter when a
+	// peer needs them via InstallSnapshot), so reading them here would just
+	// be wasted I/O proportional to snapshot size on every single restart.
+	lastIncludedIndex, lastIncludedTerm, err := n.storage.LoadSnapshotMeta()
+	if err != nil {
+		return fmt.Errorf("raft: load snapshot: %w", err)
+	}
+	if lastIncludedIndex > 0 {
+		n.lastIncludedIndex = lastIncludedIndex
+		n.lastIncludedTerm = lastIncludedTerm
+		n.log = []*LogEntry{{Index: lastIncludedIndex, Term: lastIncludedTerm}}
+		n.commitIndex = lastIncludedIndex
+	}
+
 	// Recover persisted hard state
 	term, votedFor, err := n.storage.LoadHardState()
 	if err != nil {
@@ -143,7 +225,7 @@ func (n *Node) Start() error {
 	n.currentTerm = term
 	n.votedFor = votedFor
 
-	// Recover log
+	// Recover log entries after the snapshot baseline (if any)
 	entries, err := n.storage.LoadEntries()
 	if err != nil {
 		return fmt.Errorf("raft: load log: %w", err)
@@ -156,12 +238,12 @@ func (n *Node) Start() error {
 	// background goroutine is running, n.currentTerm/n.log may be mutated
 	// (e.g. by a near-instant election) without n.mu held here, which is a
 	// data race under the race detector even though it's log-line-only.
-	startTerm, startLogLen := n.currentTerm, len(n.log)-1
+	startTerm, startLastIndex := n.currentTerm, n.lastLogIndex()
 
 	n.wg.Add(1)
 	go n.run()
 
-	log.Printf("[%s] started: term=%d log_len=%d", n.cfg.ID, startTerm, startLogLen)
+	log.Printf("[%s] started: term=%d last_log_index=%d", n.cfg.ID, startTerm, startLastIndex)
 	return nil
 }
 
@@ -232,11 +314,44 @@ func (n *Node) IsLeader() bool {
 	return n.role == RoleLeader
 }
 
-// GetState returns (currentTerm, isLeader) — useful for tests.
+// GetState returns (currentTerm, isLeader) - useful for tests.
 func (n *Node) GetState() (uint64, bool) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.currentTerm, n.role == RoleLeader
+}
+
+// SnapshotIndex returns the index of the most recent snapshot this node has
+// taken or installed (lastIncludedIndex), or 0 if it has never snapshotted.
+func (n *Node) SnapshotIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lastIncludedIndex
+}
+
+// LastLogIndex returns this node's own last log index - paired with
+// MatchIndexes, lets a caller compute per-peer replication lag.
+func (n *Node) LastLogIndex() uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.lastLogIndex()
+}
+
+// MatchIndexes returns a snapshot copy of the leader's per-peer replication
+// progress (highest log index known replicated to each peer), for
+// monitoring replication lag. Returns an empty map if this node isn't
+// currently leader - that bookkeeping is only meaningful while leading.
+func (n *Node) MatchIndexes() map[string]uint64 {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.role != RoleLeader {
+		return map[string]uint64{}
+	}
+	out := make(map[string]uint64, len(n.matchIndex))
+	for peerID, idx := range n.matchIndex {
+		out[peerID] = idx
+	}
+	return out
 }
 
 // ── Main event loop ────────────────────────────────────────────────────────────
@@ -250,7 +365,7 @@ func (n *Node) run() {
 		// election goroutines under n.mu (see startElection, becomeLeader,
 		// becomeFollower, HandleAppendEntries). Snapshot the channel values
 		// under the same lock before selecting on them, rather than reading
-		// the fields directly in the select — the latter races with those
+		// the fields directly in the select - the latter races with those
 		// writers even though the field values themselves change rarely.
 		n.mu.Lock()
 		electionC := n.electionTimerC()
@@ -300,7 +415,7 @@ func (n *Node) startElection() {
 	votes := 1
 	needed := n.quorum()
 
-	// Single-node cluster: our own vote is sufficient — become leader immediately.
+	// Single-node cluster: our own vote is sufficient - become leader immediately.
 	if votes >= needed {
 		n.becomeLeader()
 		return
@@ -362,6 +477,10 @@ func (n *Node) becomeLeader() {
 	n.sendHeartbeats()
 	n.resetHeartbeatTimer()
 	n.electionTimer.Stop()
+
+	if n.OnBecomeLeader != nil {
+		n.OnBecomeLeader()
+	}
 }
 
 // becomeFollower steps down to Follower, updating term if needed.
@@ -437,7 +556,7 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 		return resp // success = false
 	}
 
-	// Valid leader — reset election timer and update term if needed
+	// Valid leader - reset election timer and update term if needed
 	if req.Term > n.currentTerm {
 		n.becomeFollower(req.Term)
 	} else {
@@ -452,30 +571,43 @@ func (n *Node) HandleAppendEntries(req *pb.AppendEntriesRequest) *pb.AppendEntri
 	// If we don't have that entry (or it has a different term), our logs have diverged.
 	if req.PrevLogIndex > 0 {
 		if req.PrevLogIndex > n.lastLogIndex() {
-			// We're missing entries — tell leader where our log ends
+			// We're missing entries - tell leader where our log ends
 			resp.ConflictIndex = n.lastLogIndex() + 1
 			resp.ConflictTerm = 0
 			return resp
 		}
-		if n.log[req.PrevLogIndex].Term != req.PrevLogTerm {
-			// Term mismatch — find the first index of the conflicting term for fast rollback
-			conflictTerm := n.log[req.PrevLogIndex].Term
-			resp.ConflictTerm = conflictTerm
-			resp.ConflictIndex = req.PrevLogIndex
-			for resp.ConflictIndex > 1 && n.log[resp.ConflictIndex-1].Term == conflictTerm {
-				resp.ConflictIndex--
+		if pos, ok := n.logPos(req.PrevLogIndex); ok {
+			if n.log[pos].Term != req.PrevLogTerm {
+				// Term mismatch - find the first index of the conflicting term for fast rollback
+				conflictTerm := n.log[pos].Term
+				resp.ConflictTerm = conflictTerm
+				resp.ConflictIndex = req.PrevLogIndex
+				for resp.ConflictIndex > n.lastIncludedIndex+1 {
+					p, ok := n.logPos(resp.ConflictIndex - 1)
+					if !ok || n.log[p].Term != conflictTerm {
+						break
+					}
+					resp.ConflictIndex--
+				}
+				return resp
 			}
-			return resp
 		}
+		// else: PrevLogIndex is at or before our snapshot baseline. Everything
+		// up to lastIncludedIndex is committed by construction (a snapshot can
+		// only cover applied entries), so the consistency check trivially
+		// passes - fall through to appending entries.
 	}
 
 	// Append any new entries, truncating conflicting entries first
 	for i, entry := range req.Entries {
 		idx := req.PrevLogIndex + uint64(i) + 1
-		if idx < uint64(len(n.log)) {
-			if n.log[idx].Term != entry.Term {
+		if idx <= n.lastIncludedIndex {
+			continue // already compacted into our snapshot - nothing to do
+		}
+		if pos, ok := n.logPos(idx); ok {
+			if n.log[pos].Term != entry.Term {
 				// Conflict: truncate our log here and append from leader
-				n.log = n.log[:idx]
+				n.log = n.log[:pos]
 				if err := n.storage.TruncateSuffix(idx - 1); err != nil {
 					log.Printf("[%s] ERROR: truncate log at %d: %v", n.cfg.ID, idx-1, err)
 				}
@@ -517,17 +649,131 @@ func (n *Node) HandleInstallSnapshot(req *pb.InstallSnapshotRequest) *pb.Install
 	resp := &pb.InstallSnapshotResponse{Term: n.currentTerm}
 
 	if req.Term < n.currentTerm {
-		return resp
+		return resp // Success = false
 	}
 	if req.Term > n.currentTerm {
 		n.becomeFollower(req.Term)
+	} else {
+		// A snapshot from a valid leader is also proof of life, same as a
+		// heartbeat - reset our election timer so we don't start a spurious
+		// election while a (possibly large) transfer is in progress.
+		n.role = RoleFollower
+		n.resetElectionTimer()
+	}
+	n.leaderID = req.LeaderId
+	resp.Term = n.currentTerm
+
+	// Reject a snapshot that's no newer than what we already have. Without
+	// this, a retried or reordered RPC (e.g. after a leader change) could
+	// regress a follower that has already caught up normally via
+	// AppendEntries. Success=true here because nothing is actually wrong -
+	// we're just already ahead of or at this snapshot.
+	if req.LastIncludedIndex <= n.lastIncludedIndex {
+		resp.Success = true
+		return resp
 	}
 
-	// In a full implementation: write req.Data to disk, then apply the snapshot
-	// to the state machine. For now we just update our term tracking.
-	// The snapshot application logic lives in server/statemachine.go.
-	resp.Term = n.currentTerm
+	if req.Offset == 0 {
+		// Start (or restart) a transfer - reset the reassembly buffer. A
+		// leader restarting a failed transfer always begins at offset 0.
+		n.recvSnapshot = &snapshotRecvState{
+			lastIncludedIndex: req.LastIncludedIndex,
+			lastIncludedTerm:  req.LastIncludedTerm,
+		}
+	}
+	if n.recvSnapshot == nil ||
+		n.recvSnapshot.lastIncludedIndex != req.LastIncludedIndex ||
+		uint64(len(n.recvSnapshot.data)) != req.Offset {
+		// Chunk doesn't fit where we expect (no transfer in progress, wrong
+		// snapshot, or offset mismatch) - reject rather than mis-concatenate.
+		// The leader will notice via Success=false and restart from offset 0.
+		return resp
+	}
+
+	n.recvSnapshot.data = append(n.recvSnapshot.data, req.Data...)
+	resp.Success = true
+
+	if !req.Done {
+		return resp
+	}
+
+	// Final chunk: install it.
+	data := n.recvSnapshot.data
+	lastIncludedIndex := n.recvSnapshot.lastIncludedIndex
+	lastIncludedTerm := n.recvSnapshot.lastIncludedTerm
+	n.recvSnapshot = nil
+
+	if err := n.storage.SaveSnapshot(data, lastIncludedIndex, lastIncludedTerm); err != nil {
+		log.Printf("[%s] ERROR: save installed snapshot: %v", n.cfg.ID, err)
+		resp.Success = false
+		return resp
+	}
+	if err := n.storage.TruncatePrefix(lastIncludedIndex); err != nil {
+		log.Printf("[%s] ERROR: truncate prefix after installing snapshot: %v", n.cfg.ID, err)
+	}
+
+	// Conservative simplification vs. the Raft paper's "retain matching
+	// suffix" optimization (§7): discard the entire in-memory log rather
+	// than keeping any entries we already have that happen to match the
+	// leader's. Simpler and always correct, at the cost of possibly
+	// re-replicating a few entries we didn't strictly need to.
+	n.log = []*LogEntry{{Index: lastIncludedIndex, Term: lastIncludedTerm}}
+	n.lastIncludedIndex = lastIncludedIndex
+	n.lastIncludedTerm = lastIncludedTerm
+	if lastIncludedIndex > n.commitIndex {
+		n.commitIndex = lastIncludedIndex
+	}
+
+	// Notify the application layer under the same lock advanceCommitTo uses,
+	// so all ApplyCh producers share one total order.
+	select {
+	case n.ApplyCh <- ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      data,
+		SnapshotIndex: lastIncludedIndex,
+		SnapshotTerm:  lastIncludedTerm,
+	}:
+	case <-n.stopCh:
+	}
+
 	return resp
+}
+
+// CompactLog persists a snapshot covering entries up to and including
+// lastIncludedIndex, then discards them from the in-memory log and durable
+// log storage. Called by the application layer once it has produced a
+// snapshot of its own state as of that index - Node has no opinion on when
+// to snapshot, only how to record that one happened.
+func (n *Node) CompactLog(data []byte, lastIncludedIndex, lastIncludedTerm uint64) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if lastIncludedIndex <= n.lastIncludedIndex {
+		return nil // stale - we've already compacted at least this far
+	}
+	if lastIncludedIndex > n.commitIndex {
+		return fmt.Errorf("raft: cannot compact past commitIndex (%d > %d)", lastIncludedIndex, n.commitIndex)
+	}
+
+	if err := n.storage.SaveSnapshot(data, lastIncludedIndex, lastIncludedTerm); err != nil {
+		return fmt.Errorf("raft: save snapshot: %w", err)
+	}
+	if err := n.storage.TruncatePrefix(lastIncludedIndex); err != nil {
+		return fmt.Errorf("raft: truncate prefix: %w", err)
+	}
+
+	if pos, ok := n.logPos(lastIncludedIndex); ok {
+		// n.log[pos] is the real entry at lastIncludedIndex; its Index/Term
+		// already match what a fresh sentinel would hold, so it becomes the
+		// new log[0] simply by slicing - no need to construct a new one.
+		n.log = n.log[pos:]
+	} else {
+		n.log = []*LogEntry{{Index: lastIncludedIndex, Term: lastIncludedTerm}}
+	}
+	n.lastIncludedIndex = lastIncludedIndex
+	n.lastIncludedTerm = lastIncludedTerm
+
+	return nil
 }
 
 // ── Log replication ───────────────────────────────────────────────────────────
@@ -552,18 +798,30 @@ func (n *Node) replicateToPeer(peerID string) {
 	}
 
 	nextIdx := n.nextIndex[peerID]
+	if nextIdx <= n.lastIncludedIndex {
+		// The peer needs entries we've already compacted away - send a
+		// snapshot instead of AppendEntries.
+		n.mu.Unlock()
+		n.sendSnapshotToPeer(peerID)
+		return
+	}
+
 	prevLogIndex := nextIdx - 1
 
 	// Collect entries to send (from nextIdx to end of log)
 	var entries []*LogEntry
 	if nextIdx <= n.lastLogIndex() {
-		entries = make([]*LogEntry, len(n.log[nextIdx:]))
-		copy(entries, n.log[nextIdx:])
+		if pos, ok := n.logPos(nextIdx); ok {
+			entries = make([]*LogEntry, len(n.log[pos:]))
+			copy(entries, n.log[pos:])
+		}
 	}
 
 	var prevLogTerm uint64
-	if prevLogIndex > 0 && prevLogIndex < uint64(len(n.log)) {
-		prevLogTerm = n.log[prevLogIndex].Term
+	if prevLogIndex > 0 {
+		if pos, ok := n.logPos(prevLogIndex); ok {
+			prevLogTerm = n.log[pos].Term
+		}
 	}
 
 	req := &pb.AppendEntriesRequest{
@@ -578,7 +836,7 @@ func (n *Node) replicateToPeer(peerID string) {
 
 	resp, err := n.transport.AppendEntries(peerID, req)
 	if err != nil {
-		return // peer is unreachable — will retry on next heartbeat
+		return // peer is unreachable - will retry on next heartbeat
 	}
 
 	n.mu.Lock()
@@ -605,12 +863,12 @@ func (n *Node) replicateToPeer(peerID string) {
 		// Raft rule: a leader can only commit entries from its current term
 		n.maybeAdvanceCommit()
 	} else {
-		// Log mismatch — back up nextIndex using the conflict hint
+		// Log mismatch - back up nextIndex using the conflict hint
 		if resp.ConflictTerm > 0 {
 			// Find the last entry in our log with ConflictTerm
 			newNext := resp.ConflictIndex
-			for i := n.lastLogIndex(); i >= 1; i-- {
-				if n.log[i].Term == resp.ConflictTerm {
+			for i := n.lastLogIndex(); i > n.lastIncludedIndex; i-- {
+				if pos, ok := n.logPos(i); ok && n.log[pos].Term == resp.ConflictTerm {
 					newNext = i + 1
 					break
 				}
@@ -619,12 +877,89 @@ func (n *Node) replicateToPeer(peerID string) {
 		} else {
 			n.nextIndex[peerID] = resp.ConflictIndex
 		}
-		if n.nextIndex[peerID] < 1 {
-			n.nextIndex[peerID] = 1
+		if n.nextIndex[peerID] < n.lastIncludedIndex+1 {
+			n.nextIndex[peerID] = n.lastIncludedIndex + 1
 		}
 
 		// Immediately retry with the corrected nextIndex
 		go n.replicateToPeer(peerID)
+	}
+}
+
+// sendSnapshotToPeer sends our current snapshot to a peer whose nextIndex
+// has fallen at or behind lastIncludedIndex, in fixed-size chunks via
+// InstallSnapshot. Called from replicateToPeer instead of the normal
+// AppendEntries path in that case.
+func (n *Node) sendSnapshotToPeer(peerID string) {
+	n.mu.Lock()
+	if n.role != RoleLeader {
+		n.mu.Unlock()
+		return
+	}
+	term := n.currentTerm
+	lastIncludedIndex := n.lastIncludedIndex
+	lastIncludedTerm := n.lastIncludedTerm
+	n.mu.Unlock()
+
+	data, savedIndex, _, err := n.storage.LoadSnapshot()
+	if err != nil {
+		log.Printf("[%s] ERROR: load snapshot to send to %s: %v", n.cfg.ID, peerID, err)
+		return
+	}
+	if savedIndex != lastIncludedIndex {
+		// Storage's saved snapshot doesn't match what we read under the lock
+		// above (a newer CompactLog raced in) - bail and let the next
+		// heartbeat retry with up-to-date values.
+		return
+	}
+
+	offset := 0
+	for {
+		end := offset + snapshotChunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		done := end >= len(data)
+
+		req := &pb.InstallSnapshotRequest{
+			Term:              term,
+			LeaderId:          n.cfg.ID,
+			LastIncludedIndex: lastIncludedIndex,
+			LastIncludedTerm:  lastIncludedTerm,
+			Offset:            uint64(offset),
+			Data:              data[offset:end],
+			Done:              done,
+		}
+		resp, err := n.transport.InstallSnapshot(peerID, req)
+		if err != nil {
+			return // peer unreachable - retry on next heartbeat
+		}
+
+		n.mu.Lock()
+		if resp.Term > n.currentTerm {
+			n.becomeFollower(resp.Term)
+			n.mu.Unlock()
+			return
+		}
+		if n.role != RoleLeader || n.currentTerm != term {
+			n.mu.Unlock()
+			return // no longer leader for the term this transfer started in
+		}
+		if !resp.Success {
+			n.mu.Unlock()
+			return // rejected - retry from offset 0 on the next heartbeat
+		}
+		if done {
+			if lastIncludedIndex > n.matchIndex[peerID] {
+				n.matchIndex[peerID] = lastIncludedIndex
+				n.nextIndex[peerID] = lastIncludedIndex + 1
+			}
+			n.mu.Unlock()
+			return
+		}
+		n.mu.Unlock()
+
+		offset = end
 	}
 }
 
@@ -635,7 +970,8 @@ func (n *Node) maybeAdvanceCommit() {
 	for idx := n.lastLogIndex(); idx > n.commitIndex; idx-- {
 		// Only commit entries from the current term
 		// (Raft's rule to prevent the "leader completeness" violation)
-		if n.log[idx].Term != n.currentTerm {
+		pos, ok := n.logPos(idx)
+		if !ok || n.log[pos].Term != n.currentTerm {
 			continue
 		}
 
@@ -659,12 +995,12 @@ func (n *Node) maybeAdvanceCommit() {
 
 // advanceCommitTo advances commitIndex to newCommit and notifies the application.
 // MUST be called with n.mu held; it is kept held for the entire function,
-// including while sending on CommitCh (see note below).
+// including while sending on ApplyCh (see note below).
 func (n *Node) advanceCommitTo(newCommit uint64) {
 	var toNotify []*LogEntry
 	for i := n.commitIndex + 1; i <= newCommit; i++ {
-		if i < uint64(len(n.log)) {
-			toNotify = append(toNotify, n.log[i])
+		if pos, ok := n.logPos(i); ok {
+			toNotify = append(toNotify, n.log[pos])
 		}
 	}
 	n.commitIndex = newCommit
@@ -672,16 +1008,18 @@ func (n *Node) advanceCommitTo(newCommit uint64) {
 	// Send while still holding n.mu. This function can be called concurrently
 	// from different goroutines (e.g. two peers' AppendEntries responses each
 	// advancing commit via maybeAdvanceCommit). If the lock were released
-	// before sending, two such calls could interleave their CommitCh sends
+	// before sending, two such calls could interleave their ApplyCh sends
 	// out of index order; the consumer drops any entry whose index is <= its
 	// own lastApplied, so a lower-index entry arriving after a higher-index
-	// one would be silently lost, not just reordered — this previously caused
-	// a reproducible hang in server tests. CommitCh is generously buffered, so
+	// one would be silently lost, not just reordered - this previously caused
+	// a reproducible hang in server tests. ApplyCh is generously buffered, so
 	// holding the lock here only blocks other RPC handlers in the pathological
-	// case where the application has fallen far behind.
+	// case where the application has fallen far behind. HandleInstallSnapshot
+	// sends its SnapshotValid message the same way, under the same lock, so
+	// all producers share one total order.
 	for _, entry := range toNotify {
 		select {
-		case n.CommitCh <- CommitNotify{Entry: entry}:
+		case n.ApplyCh <- ApplyMsg{CommandValid: true, Entry: entry}:
 		case <-n.stopCh:
 			return
 		}
@@ -690,13 +1028,30 @@ func (n *Node) advanceCommitTo(newCommit uint64) {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+// logPos translates a Raft log index into a position in n.log, accounting
+// for entries already compacted away into a snapshot. Returns ok=false if
+// index is before lastIncludedIndex (compacted away, no longer in memory -
+// see maybeSendSnapshot/HandleInstallSnapshot for how that case is handled)
+// or beyond what we currently have. Every read of n.log by Raft index
+// (never by raw slice position) MUST go through this.
+func (n *Node) logPos(index uint64) (int, bool) {
+	if index < n.lastIncludedIndex {
+		return 0, false
+	}
+	pos := int(index - n.lastIncludedIndex)
+	if pos >= len(n.log) {
+		return 0, false
+	}
+	return pos, true
+}
+
 func (n *Node) lastLogIndex() uint64 {
-	return uint64(len(n.log) - 1)
+	return n.lastIncludedIndex + uint64(len(n.log)-1)
 }
 
 func (n *Node) lastLogTerm() uint64 {
 	if len(n.log) == 0 {
-		return 0
+		return n.lastIncludedTerm
 	}
 	return n.log[len(n.log)-1].Term
 }
