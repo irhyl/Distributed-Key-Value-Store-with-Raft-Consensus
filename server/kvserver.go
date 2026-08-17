@@ -1,4 +1,4 @@
-// kvserver.go — the gRPC server that handles two kinds of traffic:
+// kvserver.go - the gRPC server that handles two kinds of traffic:
 //   1. Raft RPCs from peer nodes (RequestVote, AppendEntries, InstallSnapshot)
 //   2. KV RPCs from clients (Get, Put, Delete)
 
@@ -31,6 +31,8 @@ type KVServer struct {
 	sm        *StateMachine
 	grpcSrv   *grpc.Server
 	transport *GRPCTransport
+	walState  *walState
+	stopCh    chan struct{}
 }
 
 // Config holds the full configuration for a KVServer node.
@@ -39,6 +41,7 @@ type Config struct {
 	ListenAddr  string            // address to bind the gRPC server on
 	Peers       map[string]string // peerID → gRPC address (other nodes)
 	DataDir     string            // directory for WAL and SSTable files
+	MetricsAddr string            // if set, serve Prometheus metrics at http://MetricsAddr/metrics
 }
 
 // leaderHintAddr translates the Raft leader ID returned by node.LeaderID()
@@ -93,9 +96,12 @@ func NewKVServer(cfg Config) (*KVServer, error) {
 		sm:        sm,
 		grpcSrv:   grpcSrv,
 		transport: transport,
+		walState:  walState,
+		stopCh:    make(chan struct{}),
 	}
 	pb.RegisterRaftServiceServer(grpcSrv, srv)
 	pb.RegisterKVServiceServer(grpcSrv, srv)
+	srv.wireMetrics()
 
 	return srv, nil
 }
@@ -111,6 +117,9 @@ func (s *KVServer) Start(listenAddr string) error {
 		return fmt.Errorf("raft start: %w", err)
 	}
 
+	ServeMetrics(s.cfg.MetricsAddr)
+	startReplicationLagUpdater(s.node, s.stopCh)
+
 	log.Printf("[%s] listening on %s", s.node.LeaderID(), listenAddr)
 	go func() {
 		if err := s.grpcSrv.Serve(lis); err != nil {
@@ -122,6 +131,7 @@ func (s *KVServer) Start(listenAddr string) error {
 
 // Stop gracefully shuts down the server.
 func (s *KVServer) Stop() {
+	close(s.stopCh)
 	s.grpcSrv.GracefulStop()
 	s.sm.Stop()
 	s.node.Stop()
@@ -190,4 +200,28 @@ func (s *KVServer) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteR
 		return nil, err
 	}
 	return &pb.DeleteResponse{Success: true}, nil
+}
+
+// Watch streams every write applied on this node from the point of
+// subscription onward - change data capture. Unlike Get/Put/Delete, this
+// works on any node (not leader-only): a follower's applied stream lags the
+// leader's by at most one replication round trip, which is an acceptable
+// tradeoff for a change feed and means Watch doesn't need leader redirection.
+func (s *KVServer) Watch(req *pb.WatchRequest, stream pb.KVService_WatchServer) error {
+	events, unsubscribe := s.sm.Subscribe(req.KeyPrefix)
+	defer unsubscribe()
+
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return fmt.Errorf("watch: subscriber fell too far behind and was disconnected")
+			}
+			if err := stream.Send(event); err != nil {
+				return err
+			}
+		case <-stream.Context().Done():
+			return stream.Context().Err()
+		}
+	}
 }
