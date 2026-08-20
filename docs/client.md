@@ -2,7 +2,7 @@
 
 ## Overview
 
-`raftkv-cli` is the command-line interface for interacting with a raftkv cluster. It connects directly to nodes via gRPC and handles the complexity of finding the current leader transparently — the user never needs to know which node is the leader.
+`raftkv-cli` is the command-line interface for interacting with a raftkv cluster. It connects directly to nodes via gRPC and handles the complexity of finding the current leader transparently - the user never needs to know which node is the leader.
 
 Source: [client/main.go](../client/main.go)
 
@@ -30,8 +30,8 @@ raftkv-cli --peers $PEERS delete greeting
 ```
 
 **Exit codes:**
-- `0` — success
-- `1` — error (operation failed, cluster unreachable, or bad arguments)
+- `0` - success
+- `1` - error (operation failed, cluster unreachable, or bad arguments)
 
 **Output:**
 - `put` / `delete`: prints `OK` on success, nothing otherwise
@@ -61,10 +61,10 @@ The `redirectFirst` function moves the hint address to the front without discard
 ### Example trace
 
 ```
-Attempt 1: Connect to localhost:7001 (node1 — follower)
+Attempt 1: Connect to localhost:7001 (node1 - follower)
            → Response: LeaderHint = "localhost:7002"
 
-Attempt 2: Connect to localhost:7002 (node2 — leader)
+Attempt 2: Connect to localhost:7002 (node2 - leader)
            → Response: Success=true, "OK" printed
 ```
 
@@ -73,7 +73,7 @@ If node2 then fails mid-test:
 ```
 Attempt 3: Connect to localhost:7002 (dead) → connection error, wait 300ms
 
-Attempt 4: Connect to localhost:7003 (node3 — new leader after election)
+Attempt 4: Connect to localhost:7003 (node3 - new leader after election)
            → Response: Success=true
 ```
 
@@ -81,9 +81,9 @@ Attempt 4: Connect to localhost:7003 (node3 — new leader after election)
 
 ## Connection lifecycle
 
-Each command creates a fresh gRPC connection, uses it for one RPC, and immediately closes it. This simplifies the client significantly — no connection pooling, no stale connection detection, no health-check goroutines.
+Each command creates a fresh gRPC connection, uses it for one RPC, and immediately closes it. This simplifies the client significantly - no connection pooling, no stale connection detection, no health-check goroutines.
 
-The trade-off is latency: TLS handshake + TCP connection setup adds ~1–5ms per command. For an interactive CLI that humans use, this is fine. For a library used in application code, you would maintain a persistent connection.
+The trade-off is latency: TLS handshake + TCP connection setup adds ~1-5ms per command. For an interactive CLI that humans use, this is fine. For a library used in application code, you would maintain a persistent connection.
 
 ```go
 func dial(addr string) (pb.KVServiceClient, *grpc.ClientConn, error) {
@@ -127,7 +127,7 @@ The CLI's retry logic (up to 10 attempts, 300ms between) is important here: duri
 
 ## Adding client IDs and sequence numbers
 
-For deduplication to work, the CLI would need to attach a `ClientID` and `SeqNum` to each write. The current implementation sends empty values for these fields, which means deduplication is effectively disabled at the CLI level — the state machine can't distinguish two CLI invocations.
+For deduplication to work, the CLI would need to attach a `ClientID` and `SeqNum` to each write. The current implementation sends empty values for these fields, which means deduplication is effectively disabled at the CLI level - the state machine can't distinguish two CLI invocations.
 
 This is intentional for a CLI: each CLI invocation is typically a distinct intended operation. The deduplication feature is more relevant for library clients (e.g., a Go service using raftkv) that retry internally and need at-most-once semantics across retries.
 

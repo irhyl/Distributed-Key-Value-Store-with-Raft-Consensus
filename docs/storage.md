@@ -2,13 +2,13 @@
 
 ## The core insight
 
-Random writes to disk are slow — even on SSDs, random I/O costs orders of magnitude more than sequential I/O. The key idea behind an LSM (Log-Structured Merge) tree is: **never do random writes**. Instead:
+Random writes to disk are slow - even on SSDs, random I/O costs orders of magnitude more than sequential I/O. The key idea behind an LSM (Log-Structured Merge) tree is: **never do random writes**. Instead:
 
 1. Accept all writes into an in-memory buffer (Memtable)
 2. When the buffer fills, write it to disk as a single sorted sequential file (SSTable)
 3. Periodically merge multiple SSTable files in the background (compaction)
 
-Reads pay a cost — multiple places must be checked — but writes are always sequential, which is fast.
+Reads pay a cost - multiple places must be checked - but writes are always sequential, which is fast.
 
 This is the same architecture used by LevelDB, RocksDB, Cassandra, HBase, and InfluxDB.
 
@@ -46,7 +46,7 @@ Read path:
 
 ## Memtable
 
-The Memtable is a sorted, in-memory buffer for recent writes. It is the only place where data is mutable — all other structures are immutable once written.
+The Memtable is a sorted, in-memory buffer for recent writes. It is the only place where data is mutable - all other structures are immutable once written.
 
 ### Data structure
 
@@ -65,11 +65,11 @@ type memEntry struct {
 }
 ```
 
-Entries are stored in a slice sorted by key. Binary search (`sort.Search`) locates the insertion point in O(log n). When a key is updated, the old entry is replaced in-place — the slice stays sorted and the size stays bounded.
+Entries are stored in a slice sorted by key. Binary search (`sort.Search`) locates the insertion point in O(log n). When a key is updated, the old entry is replaced in-place - the slice stays sorted and the size stays bounded.
 
 ### Why a sorted slice instead of a hash map?
 
-An unsorted hash map would give O(1) point lookups but would require a full sort at flush time. A sorted slice gives O(log n) everything — insert, lookup, range scan — and is already sorted when it's time to flush. No sorting step at flush time means the flush I/O is minimal and predictable.
+An unsorted hash map would give O(1) point lookups but would require a full sort at flush time. A sorted slice gives O(log n) everything - insert, lookup, range scan - and is already sorted when it's time to flush. No sorting step at flush time means the flush I/O is minimal and predictable.
 
 ### Tombstones
 
@@ -108,7 +108,7 @@ An SSTable (Sorted String Table) is an immutable, sorted file on disk. Once writ
 │  BLOOM FILTER BLOCK  (1024 bytes)                            │
 │  8192-bit bit array; 7 hash functions                        │
 ├──────────────────────────────────────────────────────────────┤
-│  FOOTER  (24 bytes, fixed — always at file end)              │
+│  FOOTER  (24 bytes, fixed - always at file end)              │
 │    8 bytes: bloom_offset  (byte offset of bloom block)       │
 │    8 bytes: bloom_size    (byte length of bloom block)       │
 │    4 bytes: entry_count                                      │
@@ -173,7 +173,7 @@ Compaction runs when the SSTable count reaches 8 (the `compactionThreshold`). It
 6. Delete old SSTable files
 ```
 
-The merge produces a file that is the same as reading all the old SSTables at once — but stored on disk and queryable with one bloom filter check instead of N.
+The merge produces a file that is the same as reading all the old SSTables at once - but stored on disk and queryable with one bloom filter check instead of N.
 
 ### Write amplification
 
@@ -244,3 +244,5 @@ The lock is never held during disk I/O. All slow operations (SSTable writes, rea
 | `Engine.flushWorker` | [storage/engine.go](../storage/engine.go) | Background Memtable → SSTable flush |
 | `Engine.compactionWorker` | [storage/engine.go](../storage/engine.go) | Background SSTable merge |
 | `Engine.loadSSTables` | [storage/engine.go](../storage/engine.go) | Recovery: load existing SSTable files on startup |
+| `Engine.Snapshot` | [storage/snapshot.go](../storage/snapshot.go) | Point-in-time dump of all live keys, merging memtable(s) + SSTables |
+| `Engine.LoadSnapshot` | [storage/snapshot.go](../storage/snapshot.go) | Replace all on-disk and in-memory state with a snapshot's contents |

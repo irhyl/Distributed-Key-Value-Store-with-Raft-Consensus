@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `server/` package is the glue layer. It takes three independent components — the Raft node, the WAL, and the LSM engine — and wires them into a running gRPC server that accepts client requests and participates in consensus.
+The `server/` package is the glue layer. It takes three independent components - the Raft node, the WAL, and the LSM engine - and wires them into a running gRPC server that accepts client requests and participates in consensus.
 
 ```
 server/
@@ -10,7 +10,10 @@ server/
 ├── statemachine.go  Apply loop: turns committed Raft entries into storage writes
 ├── walstate.go      Bridges raft.PersistentState → our WAL implementation
 ├── transport.go     Bridges raft.Transport → gRPC connections to peer nodes
-└── statemachine_test.go
+├── metrics.go       Prometheus counters/histograms, /metrics endpoint
+├── watch.go         change-data-capture fan-out for the Watch RPC
+├── statemachine_test.go
+└── walstate_test.go
 ```
 
 ---
@@ -23,12 +26,15 @@ server/
 
 ```go
 type KVServer struct {
-    cfg       Config         // NodeID, ListenAddr, Peers, DataDir
+    cfg       Config         // NodeID, ListenAddr, Peers, DataDir, MetricsAddr
     node      *raft.Node     // consensus
     engine    *storage.Engine // durability
     sm        *StateMachine  // applies committed entries
     grpcSrv   *grpc.Server   // network
     transport *GRPCTransport // peer connections
+    walState  *walState      // kept around so metrics.go can attach WAL hooks
+    stopCh    chan struct{}  // signals background goroutines (e.g. the
+                              // replication-lag metrics sampler) to stop
 }
 ```
 
@@ -44,7 +50,10 @@ The components must be created in dependency order:
 5. NewStateMachine(node, engine)       → sm
 6. grpc.NewServer()                    → grpcSrv
 7. register RaftService + KVService on grpcSrv
+8. wireMetrics()                       → attach OnBecomeLeader/OnFsync/OnCompaction hooks
 ```
+
+`Start()` additionally begins serving `/metrics` (if `MetricsAddr` is set) and starts the replication-lag sampler.
 
 ### gRPC handlers
 
@@ -64,6 +73,8 @@ Get, Put, and Delete all follow the same pattern:
 1. Delegate to the StateMachine
 2. If `ErrNotLeader`, return `LeaderHint` (the dial address of the current leader)
 3. If success, return the result
+
+`Watch` is different: it works on any node (not leader-only) and streams `ChangeEvent`s from `StateMachine.Subscribe` until the client disconnects or falls too far behind. See the "Change data capture" section in the main README.
 
 ### Leader hint
 
@@ -85,7 +96,7 @@ func (s *KVServer) leaderHintAddr() string {
 
 [server/statemachine.go](../server/statemachine.go)
 
-The StateMachine is the bridge between Raft's `CommitCh` and the LSM engine. It also tracks in-flight client writes and unblocks them when their entries commit.
+The StateMachine is the bridge between Raft's `ApplyCh` and the LSM engine. It also tracks in-flight client writes and unblocks them when their entries commit, fans out applied writes to `Watch` subscribers, and (if `WithSnapshotInterval` is set) periodically snapshots the engine and compacts the Raft log.
 
 ### Command format
 
@@ -106,14 +117,18 @@ Commands are serialised as JSON before being passed to `Raft.Propose`. JSON is u
 ```go
 func (sm *StateMachine) ProposeWrite(cmd Command) error {
     data, _ := json.Marshal(cmd)
+
+    // sm.mu is held across Propose() and registering the pending waiter,
+    // not just around the map write. See below for why.
+    sm.mu.Lock()
     logIndex, term, isLeader := sm.node.Propose(data)
     if !isLeader {
+        sm.mu.Unlock()
         return ErrNotLeader
     }
-
-    // Register a channel to receive the result
     done := make(chan Result, 1)
     sm.pending[logIndex] = &pendingWrite{logIndex, term, done}
+    sm.mu.Unlock()
 
     // Block until commit or shutdown
     select {
@@ -127,25 +142,39 @@ func (sm *StateMachine) ProposeWrite(cmd Command) error {
 
 The client goroutine blocks on `done` until the applyLoop processes the entry and sends a result. This gives natural backpressure: if Raft is slow, the client waits rather than queuing unboundedly.
 
+**Why `sm.mu` spans both calls:** on a single-node cluster, `Propose` can commit and notify synchronously, in the same call, before this function gets back around to registering `done` in `sm.pending`. If that race wins, the notification finds nothing to deliver to and is dropped, and this call hangs forever waiting for a result that already happened. `apply()` also takes `sm.mu` before calling `notifyPending`, so holding it here across both steps means the apply loop can't get ahead of registration.
+
 ### applyLoop: single-goroutine apply
 
 ```go
 func (sm *StateMachine) applyLoop() {
     for {
         select {
-        case notify := <-sm.node.CommitCh:
-            sm.apply(notify.Entry)
+        case msg := <-sm.node.ApplyCh:
+            sm.dispatch(msg)
         case <-sm.stopCh:
             // drain remaining
             return
         }
     }
 }
+
+func (sm *StateMachine) dispatch(msg raft.ApplyMsg) {
+    switch {
+    case msg.CommandValid:
+        sm.apply(msg.Entry)
+        if sm.snapshotInterval > 0 && msg.Entry.Index%sm.snapshotInterval == 0 {
+            sm.maybeSnapshot(msg.Entry.Index, msg.Entry.Term)
+        }
+    case msg.SnapshotValid:
+        sm.applySnapshot(msg)
+    }
+}
 ```
 
-The apply loop is deliberately single-threaded. A single goroutine consuming `CommitCh` guarantees that entries are applied in strict log order. If parallel application were used (for throughput), per-key ordering would need to be tracked explicitly — significantly more complex.
+The apply loop is deliberately single-threaded. A single goroutine consuming `ApplyCh` guarantees that entries are applied in strict log order, and that a snapshot install (`applySnapshot`) never runs concurrently with a normal `apply()`. If parallel application were used (for throughput), per-key ordering would need to be tracked explicitly - significantly more complex.
 
-This is the same design as etcd.
+This is the same design as etcd. The snapshot trigger runs after `apply()` returns, not inside it, so it doesn't hold `sm.mu` during the engine snapshot I/O - but it's still on this same goroutine, so it can't overlap with applying the next entry.
 
 ### apply: deduplication and storage write
 
@@ -172,20 +201,26 @@ func (sm *StateMachine) apply(entry *raft.LogEntry) {
     case "delete": sm.engine.Delete(cmd.Key)
     }
 
-    // 5. Update dedup tracker
-    sm.lastSeq[cmd.ClientID] = cmd.SeqNum
+    // 5. Publish to Watch subscribers (only on a real, successful apply -
+    //    not for the skipped-duplicate path above)
+    sm.broadcaster.publish(&pb.ChangeEvent{...})
 
-    // 6. Advance lastApplied
+    // 6. Update dedup tracker, but only after a successful apply
+    if cmd.ClientID != "" {
+        sm.lastSeq[cmd.ClientID] = cmd.SeqNum
+    }
+
+    // 7. Advance lastApplied
     sm.lastApplied = entry.Index
 
-    // 7. Wake any client waiting on this log index
+    // 8. Wake any client waiting on this log index
     sm.notifyPending(entry.Index, Result{})
 }
 ```
 
 ### Deduplication: at-most-once semantics
 
-The problem: a client sends `PUT foo=bar`, the leader commits it and responds, but the network drops the response. The client retries. Without deduplication, `foo` is written twice — harmless for a simple PUT, but catastrophic for a balance decrement.
+The problem: a client sends `PUT foo=bar`, the leader commits it and responds, but the network drops the response. The client retries. Without deduplication, `foo` is written twice - harmless for a simple PUT, but catastrophic for a balance decrement.
 
 The solution: each client attaches a monotonically increasing `SeqNum` to every write. The state machine tracks the highest applied `SeqNum` per `ClientID`. If `SeqNum <= lastSeq[ClientID]`, the write is a retry and is silently skipped. The client still gets an OK response (the entry committed; it's just not re-applied).
 
@@ -207,7 +242,7 @@ func (sm *StateMachine) notifyPending(logIndex uint64, result Result) {
 }
 ```
 
-The send is non-blocking: if the client goroutine already gave up (timed out), the result is dropped. The state was still applied — the client just doesn't know yet. On retry, the deduplication logic will recognise the SeqNum and return OK without re-applying.
+The send is non-blocking: if the client goroutine already gave up (timed out), the result is dropped. The state was still applied - the client just doesn't know yet. On retry, the deduplication logic will recognise the SeqNum and return OK without re-applying.
 
 ---
 
@@ -224,6 +259,10 @@ type PersistentState interface {
     AppendEntries(entries []*LogEntry) error
     LoadEntries() ([]*LogEntry, error)
     TruncateSuffix(keepIndex uint64) error
+    SaveSnapshot(data []byte, lastIncludedIndex, lastIncludedTerm uint64) error
+    LoadSnapshot() (data []byte, lastIncludedIndex, lastIncludedTerm uint64, err error)
+    LoadSnapshotMeta() (lastIncludedIndex, lastIncludedTerm uint64, err error)
+    TruncatePrefix(discardIndex uint64) error
 }
 ```
 
@@ -234,6 +273,10 @@ type PersistentState interface {
 | `AppendEntries` | Delegate to `wal.AppendBatch` |
 | `LoadEntries` | Delegate to `wal.ReadAll` |
 | `TruncateSuffix` | Delegate to `wal.TruncateSuffix` |
+| `SaveSnapshot` | Pack (index, term, data) into one buffer, temp file + atomic rename to `snapshot.bin` |
+| `LoadSnapshot` | Read the full `snapshot.bin`, split header from data |
+| `LoadSnapshotMeta` | Read only the 16-byte header, not the data - used on every `Start()` so restart cost doesn't scale with snapshot size |
+| `TruncatePrefix` | Delegate to `wal.TruncatePrefix` |
 
 ---
 
@@ -284,7 +327,7 @@ net.Reconnect("node2")   // bring it back
 
 ## Test coverage
 
-Six tests in [server/statemachine_test.go](../server/statemachine_test.go):
+12 tests in [server/statemachine_test.go](../server/statemachine_test.go) plus 1 in [server/walstate_test.go](../server/walstate_test.go):
 
 | Test | What it proves |
 |------|----------------|
@@ -294,3 +337,9 @@ Six tests in [server/statemachine_test.go](../server/statemachine_test.go):
 | `TestMultipleWritesOrdered` | 20 writes apply in order; `lastApplied == 20` |
 | `TestDeleteRemovesKey` | DELETE makes key unreadable even though tombstone is in storage |
 | `TestCommitNotificationUnblocksPropose` | ProposeWrite returns only after commit, not before |
+| `TestSnapshotTriggersAtInterval` | `WithSnapshotInterval` compacts the log at the right boundary |
+| `TestSnapshotSurvivesRestart` | Snapshot + restart seeds the fast-path, data intact |
+| `TestWALStateSnapshotRoundTrip` | `walState.SaveSnapshot`/`LoadSnapshot` survive a reopen |
+| `TestWatchStreamsAppliedWrites` | Watch subscriber sees every write, in commit order |
+| `TestWatchFiltersByKeyPrefix` | `key_prefix` excludes non-matching keys |
+| `TestWatchDropsSlowSubscriber` | A subscriber that never drains is disconnected, not buffered forever |

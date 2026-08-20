@@ -81,6 +81,55 @@ func TestWALTruncate(t *testing.T) {
 	w.Close()
 }
 
+func TestWALTruncatePrefix(t *testing.T) {
+	dir, _ := os.MkdirTemp("", "wal-truncate-prefix-*")
+	defer os.RemoveAll(dir)
+
+	w, _ := Open(dir)
+	for i := 1; i <= 50; i++ {
+		w.Append(makeEntry(uint64(i), 1, "k", "v"))
+	}
+
+	if err := w.TruncatePrefix(30); err != nil {
+		t.Fatalf("truncate prefix: %v", err)
+	}
+
+	entries, _ := w.ReadAll()
+	if len(entries) != 20 {
+		t.Fatalf("after truncate prefix: got %d entries, want 20", len(entries))
+	}
+	if entries[0].Index != 31 {
+		t.Fatalf("first entry index: got %d want 31", entries[0].Index)
+	}
+	if entries[len(entries)-1].Index != 50 {
+		t.Fatalf("last entry index: got %d want 50", entries[len(entries)-1].Index)
+	}
+	if w.LastIndex() != 50 {
+		t.Fatalf("lastIndex: got %d want 50", w.LastIndex())
+	}
+
+	// New entries continue the sequence from where the prefix was cut, not from 1.
+	if err := w.Append(makeEntry(51, 1, "k", "v")); err != nil {
+		t.Fatalf("append after truncate: %v", err)
+	}
+	w.Close()
+
+	// Discarding everything (prefix covers the whole log) must still leave
+	// lastIndex reflecting the log's logical continuation point, not 0.
+	w2, _ := Open(dir)
+	defer w2.Close()
+	if err := w2.TruncatePrefix(51); err != nil {
+		t.Fatalf("truncate prefix (all): %v", err)
+	}
+	entries, _ = w2.ReadAll()
+	if len(entries) != 0 {
+		t.Fatalf("after full truncate: got %d entries, want 0", len(entries))
+	}
+	if w2.LastIndex() != 51 {
+		t.Fatalf("lastIndex after full truncate: got %d want 51", w2.LastIndex())
+	}
+}
+
 func TestWALBatchAppend(t *testing.T) {
 	dir, _ := os.MkdirTemp("", "wal-batch-*")
 	defer os.RemoveAll(dir)
@@ -102,8 +151,10 @@ func TestWALBatchAppend(t *testing.T) {
 	}
 }
 
-// BenchmarkAppend measures single-entry append throughput.
-// On an SSD you should see ~50k-100k ops/sec with fsync.
+// BenchmarkAppend measures single-entry append throughput (one fsync per
+// entry). Measured at ~6.9k ops/sec on an NVMe SSD (13th Gen Intel Core
+// i5-13500H) - see the README's benchmarks table for the full picture,
+// including how much batching (AppendBatch) buys over this.
 func BenchmarkAppend(b *testing.B) {
 	dir, _ := os.MkdirTemp("", "wal-bench-*")
 	defer os.RemoveAll(dir)
@@ -116,4 +167,33 @@ func BenchmarkAppend(b *testing.B) {
 		entry.Index = uint64(i + 1)
 		w.Append(entry)
 	}
+}
+
+// BenchmarkAppendBatch measures throughput when appending in batches of 50
+// (one fsync per batch, not per entry) - quantifies the "Batch fsync"
+// design decision in the README rather than just asserting it.
+func BenchmarkAppendBatch(b *testing.B) {
+	dir, _ := os.MkdirTemp("", "wal-bench-batch-*")
+	defer os.RemoveAll(dir)
+	w, _ := Open(dir)
+	defer w.Close()
+
+	const batchSize = 50
+	batch := make([]*pb.LogEntry, batchSize)
+	for i := range batch {
+		batch[i] = makeEntry(0, 1, "benchkey", "benchvalue")
+	}
+
+	b.ResetTimer()
+	idx := uint64(1)
+	for i := 0; i < b.N; i++ {
+		for j := range batch {
+			batch[j].Index = idx
+			idx++
+		}
+		if err := w.AppendBatch(batch); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.ReportMetric(float64(batchSize), "entries/batch")
 }

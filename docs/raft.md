@@ -2,13 +2,13 @@
 
 ## What Raft solves
 
-Multiple machines need to agree on a sequence of operations. If they apply the same operations in the same order, they arrive at the same state — that's the invariant. The challenge is reaching that agreement when machines can crash, network partitions can isolate nodes, and messages can arrive out of order or be lost entirely.
+Multiple machines need to agree on a sequence of operations. If they apply the same operations in the same order, they arrive at the same state - that's the invariant. The challenge is reaching that agreement when machines can crash, network partitions can isolate nodes, and messages can arrive out of order or be lost entirely.
 
 Raft breaks this problem into three mostly-independent sub-problems:
 
-1. **Leader election** — elect exactly one leader per term
-2. **Log replication** — the leader accepts entries and replicates them
-3. **Safety** — once an entry is committed, no future leader will overwrite it
+1. **Leader election** - elect exactly one leader per term
+2. **Log replication** - the leader accepts entries and replicates them
+3. **Safety** - once an entry is committed, no future leader will overwrite it
 
 ---
 
@@ -41,7 +41,7 @@ start│    │          Follower           │               │
           └─────────────────────────────┘  (no heartbeat received)
 ```
 
-Every node starts as a **Follower**. A follower that hears no heartbeat within its election timeout becomes a **Candidate** and starts an election. A candidate that receives votes from a majority becomes the **Leader**. Any node that sees a message with a higher term immediately steps back to Follower — this is the universal rule that prevents split-brain.
+Every node starts as a **Follower**. A follower that hears no heartbeat within its election timeout becomes a **Candidate** and starts an election. A candidate that receives votes from a majority becomes the **Leader**. Any node that sees a message with a higher term immediately steps back to Follower - this is the universal rule that prevents split-brain.
 
 ---
 
@@ -87,7 +87,7 @@ The third condition is the **election restriction**. It prevents a candidate wit
 
 A candidate wins when it accumulates votes from a majority (including its own). The majority threshold is `⌊N/2⌋ + 1` where N is the total cluster size. For a 3-node cluster, majority = 2.
 
-A single-node cluster has majority = 1. After voting for itself, the node wins immediately — the election loop recognises this before contacting any peers.
+A single-node cluster has majority = 1. After voting for itself, the node wins immediately - the election loop recognises this before contacting any peers.
 
 ### Randomised timeouts
 
@@ -99,7 +99,7 @@ Every node picks a random election timeout in the range `[150ms, 300ms]`. This i
 
 ### AppendEntries
 
-The leader replicates entries to followers using `AppendEntries`. The same RPC serves as a heartbeat when sent with empty entries — followers reset their election timers whenever they see it.
+The leader replicates entries to followers using `AppendEntries`. The same RPC serves as a heartbeat when sent with empty entries - followers reset their election timers whenever they see it.
 
 The request includes:
 
@@ -131,8 +131,8 @@ The leader scans backwards to find its last entry with `ConflictTerm`. If it has
 
 The leader maintains two arrays, indexed by peer ID:
 
-- `nextIndex[peer]` — the next log index to send to that peer (optimistic)
-- `matchIndex[peer]` — the highest index confirmed replicated on that peer (pessimistic)
+- `nextIndex[peer]` - the next log index to send to that peer (optimistic)
+- `matchIndex[peer]` - the highest index confirmed replicated on that peer (pessimistic)
 
 On a successful `AppendEntries`, `matchIndex` advances to `prevLogIndex + len(entries)` and `nextIndex` to `matchIndex + 1`.
 
@@ -142,7 +142,7 @@ On failure, `nextIndex` is reduced using the conflict hint and the RPC is retrie
 
 ## Commitment
 
-An entry is **committed** when it has been written to a majority of nodes' logs. Once committed, it will never be lost — any future leader will have it.
+An entry is **committed** when it has been written to a majority of nodes' logs. Once committed, it will never be lost - any future leader will have it.
 
 ### Advancing commitIndex
 
@@ -186,7 +186,7 @@ Now:  Entry at index 2 from term 1 was on S1 and S2 (majority).
       Two nodes would apply different commands at the same index: safety violation.
 ```
 
-**Fix:** A leader can only directly commit entries from its **own** term. When it commits a current-term entry, all preceding entries are committed implicitly by the log prefix invariant. The dangerous term-1 entry would get committed only as a side effect of committing a term-3 entry that precedes it — and at that point we know term-3's leader had it in its log, meaning S3 accepted it rather than overwriting it.
+**Fix:** A leader can only directly commit entries from its **own** term. When it commits a current-term entry, all preceding entries are committed implicitly by the log prefix invariant. The dangerous term-1 entry would get committed only as a side effect of committing a term-3 entry that precedes it - and at that point we know term-3's leader had it in its log, meaning S3 accepted it rather than overwriting it.
 
 In code: `if log[idx].Term != currentTerm { continue }`.
 
@@ -210,9 +210,11 @@ The first four are maintained by the algorithm; the last follows from the first 
 
 ## Heartbeats and liveness
 
-The leader sends heartbeats (empty `AppendEntries`) every `50ms`. Followers have election timeouts between `150ms` and `300ms`. This gives the leader 3–6 heartbeat intervals before a follower decides the leader is dead and starts an election.
+The leader sends heartbeats (empty `AppendEntries`) every `50ms`. Followers have election timeouts between `150ms` and `300ms`. This gives the leader 3-6 heartbeat intervals before a follower decides the leader is dead and starts an election.
 
-If a leader fails, the fastest follower times out first, starts an election, and wins before the others wake up. Total downtime is typically one election timeout (150–300ms) plus one round trip to collect votes (~10ms on LAN).
+If a leader fails, the fastest follower times out first, starts an election, and wins before the others wake up. Total downtime is typically one election timeout (150-300ms) plus one round trip to collect votes (~10ms on LAN).
+
+This node's election timer has no PreVote check: it fires and bumps `currentTerm` unconditionally, even while completely partitioned from the rest of the cluster. That's fine for a normal leader failure, but it means a node that stays disconnected for a while can come back with a term far ahead of everyone else's, which is disruptive on reconnection even though it can't actually win. See "No PreVote" in [design-decisions.md](design-decisions.md).
 
 ---
 
@@ -224,9 +226,9 @@ Raft requires three pieces of state to survive crashes:
 |-------|------|-----|
 | `currentTerm` | The highest term seen | Prevents re-using a term number |
 | `votedFor` | Who we voted for in currentTerm | Prevents voting twice in the same term |
-| `log` | All log entries | Preserves committed entries across restarts |
+| `log` | Log entries since the last snapshot | Preserves committed entries across restarts |
 
-`currentTerm` and `votedFor` are stored as a tiny JSON file (`hardstate.json`) written atomically via temp-file rename. Log entries go to the WAL.
+`currentTerm` and `votedFor` are stored as a tiny JSON file (`hardstate.json`) written atomically via temp-file rename. Log entries go to the WAL. A fourth piece, the most recent snapshot (if any) and the index/term it covers, is stored the same way and lets a restart skip replaying anything the snapshot already covers - see "Log snapshotting" in [design-decisions.md](design-decisions.md).
 
 ---
 
@@ -237,6 +239,6 @@ Raft requires three pieces of state to survive crashes:
 | [raft/node.go](../raft/node.go) | Everything: state machine, RPC handlers, election, replication |
 | [raft/memstate.go](../raft/memstate.go) | In-memory `PersistentState` used in tests |
 | [raft/memtransport.go](../raft/memtransport.go) | In-memory `Transport` with controllable partitions |
-| [raft/raft_test.go](../raft/raft_test.go) | 7 tests covering election safety, log replication, and safety under partition |
+| [raft/raft_test.go](../raft/raft_test.go) | 12 tests covering election safety, log replication, safety under partition, and snapshotting |
 | [server/walstate.go](../server/walstate.go) | Production `PersistentState`: delegates to WAL + hardstate.json |
 | [server/transport.go](../server/transport.go) | Production `Transport`: gRPC connections to peers |

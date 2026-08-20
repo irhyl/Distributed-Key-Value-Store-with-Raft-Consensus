@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-chaos.py — Chaos testing for the raftkv cluster.
+chaos.py - Chaos testing for the raftkv cluster.
 
 What it does:
   1. Starts a 3-node raftkv cluster as subprocesses
@@ -99,7 +99,7 @@ class Node:
         self.proc = None
 
     def kill(self):
-        """Abrupt kill — simulates a crash, not graceful shutdown."""
+        """Abrupt kill - simulates a crash, not graceful shutdown."""
         if self.proc and self.proc.poll() is None:
             self.proc.send_signal(signal.SIGKILL)
             self.proc.wait()
@@ -389,7 +389,7 @@ def main():
             print(f"    ... and {len(total_stats.errors) - 10} more")
 
     if all_passed:
-        print("\n  ✅ ALL ROUNDS PASSED — cluster is consistent under chaos")
+        print("\n  ✅ ALL ROUNDS PASSED - cluster is consistent under chaos")
         sys.exit(0)
     else:
         print("\n  ❌ CONSISTENCY VIOLATIONS DETECTED")

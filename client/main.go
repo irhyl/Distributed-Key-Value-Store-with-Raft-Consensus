@@ -1,4 +1,4 @@
-// client/main.go — CLI for the raftkv cluster.
+// client/main.go - CLI for the raftkv cluster.
 //
 // Usage:
 //
@@ -97,7 +97,7 @@ func doGet(peers map[string]string, key string) {
 		}
 
 		if resp.LeaderHint != "" {
-			// Not the leader — redirect and retry immediately on the hint
+			// Not the leader - redirect and retry immediately on the hint
 			addrs = redirectFirst(addrs, resp.LeaderHint)
 			continue
 		}
@@ -200,7 +200,7 @@ func dial(addr string) (pb.KVServiceClient, *grpc.ClientConn, error) {
 	defer cancel()
 
 	// DialContext+WithBlock is deprecated in favor of NewClient, but NewClient
-	// connects lazily on first RPC — we want dial itself to fail within
+	// connects lazily on first RPC - we want dial itself to fail within
 	// dialTimeout so callers get an immediate, actionable error.
 	conn, err := grpc.DialContext(ctx, addr, //nolint:staticcheck
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -246,6 +246,6 @@ func redirectFirst(addrs []string, hint string) []string {
 			return out
 		}
 	}
-	// hint is a new address not in our list — prepend it
+	// hint is a new address not in our list - prepend it
 	return append([]string{hint}, addrs...)
 }

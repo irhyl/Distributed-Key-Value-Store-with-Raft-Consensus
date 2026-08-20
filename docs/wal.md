@@ -15,8 +15,8 @@ Each record in the WAL has a fixed-size header followed by a variable-length pay
 ```
 ┌──────────────────────────────────────────────────────────┐
 │  HEADER (8 bytes)                                        │
-│    bytes 0–3: payload length   (uint32, little-endian)   │
-│    bytes 4–7: CRC32 checksum   (uint32, little-endian)   │
+│    bytes 0-3: payload length   (uint32, little-endian)   │
+│    bytes 4-7: CRC32 checksum   (uint32, little-endian)   │
 ├──────────────────────────────────────────────────────────┤
 │  PAYLOAD (N bytes)                                       │
 │    protobuf-serialised LogEntry                          │
@@ -45,9 +45,9 @@ The WAL is split into multiple segment files rather than a single growing file. 
 Segment files are named by the index of their first entry:
 
 ```
-0000000000000001.wal   ← entries 1–800 (say)
-0000000000000801.wal   ← entries 801–1500
-0000000000001501.wal   ← entries 1501–current
+0000000000000001.wal   ← entries 1-800 (say)
+0000000000000801.wal   ← entries 801-1500
+0000000000001501.wal   ← entries 1501-current
 ```
 
 Benefits of segmentation:
@@ -76,7 +76,7 @@ func (w *WAL) Append(entry *pb.LogEntry) error {
 }
 ```
 
-Every single-entry append fsyncs immediately. The client RPC does not return until the entry is on disk. This is the safe but slow path — typically used when a single proposal is in flight.
+Every single-entry append fsyncs immediately. The client RPC does not return until the entry is on disk. This is the safe but slow path - typically used when a single proposal is in flight.
 
 ### Batch AppendBatch
 
@@ -93,7 +93,7 @@ func (w *WAL) AppendBatch(entries []*pb.LogEntry) error {
 
 When Raft replicates a batch of entries (e.g., catching up a lagging follower), all entries are written with a single fsync at the end. This is the production hot path. On a modern SSD, one fsync per batch versus one fsync per entry is the difference between 50k writes/sec and 500 writes/sec.
 
-The trade-off: if the machine loses power mid-batch, only the records before the fsync are durable. But that is safe by design — only fsynced entries are acknowledged to the leader, and the leader only commits once a majority have acknowledged.
+The trade-off: if the machine loses power mid-batch, only the records before the fsync are durable. But that is safe by design - only fsynced entries are acknowledged to the leader, and the leader only commits once a majority have acknowledged.
 
 ---
 
@@ -112,11 +112,15 @@ func (w *WAL) TruncateSuffix(keepIndex uint64) error {
 }
 ```
 
-This is a full rewrite — read everything, delete everything, write the kept entries fresh. It's expensive but correct and simple. Truncation is rare (it only happens when a follower's log diverged, which requires a leader change during active replication).
+This is a full rewrite - read everything, delete everything, write the kept entries fresh. It's expensive but correct and simple. Truncation is rare (it only happens when a follower's log diverged, which requires a leader change during active replication).
 
 ### Windows portability note
 
-On POSIX systems, `os.Remove` on an open file succeeds — the file is unlinked from the directory but remains accessible via the open file descriptor until it's closed. On Windows, `os.Remove` on an open file returns an error. `TruncateSuffix` therefore closes and nils `w.current` before calling `os.Remove`, making it correct on both platforms.
+On POSIX systems, `os.Remove` on an open file succeeds - the file is unlinked from the directory but remains accessible via the open file descriptor until it's closed. On Windows, `os.Remove` on an open file returns an error. `TruncateSuffix` therefore closes and nils `w.current` before calling `os.Remove`, making it correct on both platforms.
+
+### TruncatePrefix
+
+The mirror-image operation: instead of dropping a conflicting tail, `TruncatePrefix(discardIndex)` drops everything up to and including `discardIndex`, called after a Raft snapshot has durably captured that range. Same rewrite-from-scratch approach and the same Windows close-before-remove handling, just keeping the entries above the cut point instead of below it. One subtlety: if nothing is left to keep (the whole log got discarded), `lastIndex` is set to `discardIndex`, not reset to 0 - the log logically continues from there, so the next `Append` picks up at `discardIndex+1`.
 
 ---
 
@@ -132,7 +136,7 @@ Writes use the atomic rename pattern:
 3. os.Rename(hardstate.tmp, hardstate.json)   ← atomic on POSIX and NTFS
 ```
 
-If the process crashes between step 2 and step 3, `hardstate.tmp` exists but `hardstate.json` is unchanged — the old values are intact. If it crashes during step 2, `hardstate.tmp` is partial or absent, but again `hardstate.json` is intact.
+If the process crashes between step 2 and step 3, `hardstate.tmp` exists but `hardstate.json` is unchanged - the old values are intact. If it crashes during step 2, `hardstate.tmp` is partial or absent, but again `hardstate.json` is intact.
 
 This is important because a corrupted `votedFor` could allow a node to vote twice in the same term, which violates election safety and could result in two leaders in the same term.
 
@@ -162,13 +166,15 @@ On node startup:
 
 | Symbol | Location | Description |
 |--------|----------|-------------|
-| `WAL` struct | [wal/wal.go:42](../wal/wal.go) | Main type; holds dir, current segment, buffered writer, size, lastIndex |
-| `Open` | [wal/wal.go:53](../wal/wal.go) | Open or create a WAL; recovers lastIndex on existing WAL |
-| `Append` | [wal/wal.go:97](../wal/wal.go) | Write + fsync one entry |
-| `AppendBatch` | [wal/wal.go:125](../wal/wal.go) | Write N entries + single fsync |
-| `ReadAll` | [wal/wal.go:151](../wal/wal.go) | Replay full WAL; used on startup |
-| `TruncateSuffix` | [wal/wal.go:188](../wal/wal.go) | Remove entries with index > keepIndex |
-| `writeRecord` | [wal/wal.go:260](../wal/wal.go) | Internal: write one `[len][crc][data]` record |
-| `readSegment` | [wal/wal.go:315](../wal/wal.go) | Read all valid records from one segment file |
-| `createSegment` | [wal/wal.go:278](../wal/wal.go) | Open a new segment file with `O_EXCL` |
-| `rollSegment` | [wal/wal.go:297](../wal/wal.go) | Flush + sync current, then createSegment |
+| `WAL` struct | [wal/wal.go:42](../wal/wal.go) | Main type; holds dir, current segment, buffered writer, size, lastIndex, OnFsync hook |
+| `Open` | [wal/wal.go:59](../wal/wal.go) | Open or create a WAL; recovers lastIndex on existing WAL |
+| `Append` | [wal/wal.go:103](../wal/wal.go) | Write + fsync one entry |
+| `AppendBatch` | [wal/wal.go:139](../wal/wal.go) | Write N entries + single fsync |
+| `ReadAll` | [wal/wal.go:173](../wal/wal.go) | Replay full WAL; used on startup |
+| `TruncateSuffix` | [wal/wal.go:197](../wal/wal.go) | Remove entries with index > keepIndex |
+| `TruncatePrefix` | [wal/wal.go:263](../wal/wal.go) | Remove entries with index <= discardIndex, after a snapshot |
+| `syncTimed` | [wal/wal.go:351](../wal/wal.go) | Internal: Sync() plus reporting duration via OnFsync |
+| `writeRecord` | [wal/wal.go:362](../wal/wal.go) | Internal: write one `[len][crc][data]` record |
+| `createSegment` | [wal/wal.go:382](../wal/wal.go) | Open a new segment file with `O_EXCL` |
+| `rollSegment` | [wal/wal.go:399](../wal/wal.go) | Flush + sync current, then createSegment |
+| `readSegment` | [wal/wal.go:423](../wal/wal.go) | Read all valid records from one segment file |

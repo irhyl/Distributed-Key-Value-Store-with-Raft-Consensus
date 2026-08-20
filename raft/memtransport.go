@@ -1,4 +1,4 @@
-// memtransport.go — a synchronous in-memory Transport for unit tests.
+// memtransport.go - a synchronous in-memory Transport for unit tests.
 // Nodes are wired together via a shared registry; RPCs are direct function calls.
 
 package raft

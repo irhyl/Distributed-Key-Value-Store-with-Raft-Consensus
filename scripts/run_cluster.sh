@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_cluster.sh — starts a 3-node raftkv cluster locally for manual testing.
+# run_cluster.sh - starts a 3-node raftkv cluster locally for manual testing.
 # Each node gets its own data directory under /tmp/raftkv/.
 #
 # Usage:
